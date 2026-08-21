@@ -29,7 +29,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@defarm/sdk": "github:defarm-repo/defarm-sdk-ts#fix/examples-polish-16",
+    "@defarm/sdk": "github:defarm-repo/defarm-sdk-ts#477fb43492dc8b3c71557bab9fe364ff1d9adac1",
     "@modelcontextprotocol/sdk": "^1.6.0",
     "zod": "^3.24.0"
   },
