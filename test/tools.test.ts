@@ -1,6 +1,36 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { DefarmClient, MemoryKeystore } from "@defarm/sdk";
 import { TOOLS } from "../src/tools.js";
+
+/** Collect every field name in a zod raw shape, RECURSIVELY (objects, arrays, wrappers, unions). */
+function collectFieldNames(shape: z.ZodRawShape, out: string[] = []): string[] {
+  for (const [key, schema] of Object.entries(shape)) {
+    out.push(key);
+    walkZod(schema as z.ZodTypeAny, out);
+  }
+  return out;
+}
+
+function walkZod(schema: z.ZodTypeAny, out: string[]): void {
+  const def = (schema as { _def?: Record<string, unknown> })._def;
+  if (!def) return;
+  const t = def["typeName"];
+  if (t === "ZodObject") {
+    const shape = (def["shape"] as () => z.ZodRawShape)();
+    collectFieldNames(shape, out);
+  } else if (t === "ZodArray") {
+    walkZod(def["type"] as z.ZodTypeAny, out);
+  } else if (t === "ZodOptional" || t === "ZodNullable" || t === "ZodDefault") {
+    walkZod(def["innerType"] as z.ZodTypeAny, out);
+  } else if (t === "ZodEffects") {
+    walkZod(def["schema"] as z.ZodTypeAny, out);
+  } else if (t === "ZodRecord" || t === "ZodMap") {
+    walkZod(def["valueType"] as z.ZodTypeAny, out);
+  } else if (t === "ZodUnion" || t === "ZodDiscriminatedUnion") {
+    for (const o of def["options"] as z.ZodTypeAny[]) walkZod(o, out);
+  }
+}
 
 /**
  * The tool table is the contract: names, no-credential-inputs, and handlers that actually call
@@ -54,13 +84,26 @@ describe("tool table contract", () => {
     );
   });
 
-  it("NO tool schema accepts a credential or key-material input (auth is server config)", () => {
+  it("NO tool schema accepts a credential or key-material input — at ANY depth", () => {
+    // Review finding (mcp#1): checking only top-level keys left nested objects (e.g. the
+    // recipient bundle) unguarded — exactly where a field would slip in unnoticed. This walker
+    // descends the zod tree; the self-test below proves it bites on nested fields.
     const forbidden = /password|api_?key|secret|token|priv(ate)?_?key|seed|bearer/i;
     for (const t of TOOLS) {
-      for (const field of Object.keys(t.schema)) {
+      for (const field of collectFieldNames(t.schema)) {
         expect(forbidden.test(field), `${t.name}.${field} looks like a credential input`).toBe(false);
       }
     }
+  });
+
+  it("self-test: the schema walker catches a forbidden field NESTED inside an object/array", () => {
+    const evil: z.ZodRawShape = {
+      bundle: z.object({ privateKey: z.string() }),
+      list: z.array(z.object({ inner: z.object({ apiKey: z.string() }) })).optional(),
+    };
+    const names = collectFieldNames(evil);
+    expect(names).toContain("privateKey");
+    expect(names).toContain("apiKey");
   });
 
   it("whoami / verify / get_item / resolve handlers hit the right endpoints", async () => {
