@@ -59,16 +59,12 @@ exposed as tools: an agent should not see tools that always fail.
 
 ## Development
 
-**Dependency rule (until the npm publish):** `@defarm/sdk` is pinned to a commit SHA on the
-SDK's `main`, and **the pin follows the latest SDK squash** — whenever an SDK PR merges, this
-repo repins in the same movement. A stale pin is silent: everything stays green while the MCP
-serves yesterday's SDK behavior (measured in review: an already-fixed error mapping kept
-misbehaving here because the pin lagged). The npm publish (engines#593) replaces this rule
-with semver.
+**Dependency:** `@defarm/sdk` via semver (`^0.2.0`) from npm — the SHA-pin era (and its
+"pin follows the latest SDK squash" rule) ended with the 0.2.0 publish, as promised.
 
 
 ```bash
-npm install     # builds @defarm/sdk from the git dependency
+npm install
 npm test        # tool-table contract tests (no network, fake gateway)
 npm run build && DEFARM_GATEWAY=... node dist/index.js   # stdio server
 ```

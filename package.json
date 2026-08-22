@@ -1,7 +1,7 @@
 {
   "name": "@defarm/mcp",
-  "version": "0.1.0-alpha.0",
-  "description": "DeFarm MCP server — seal, open, verify and ingest verifiable agri-traceability data from an AI agent. The DeFarm server stays cryptographically blind to sealed fields; private keys never leave the local keystore; credentials never flow through the model.",
+  "version": "0.1.0",
+  "description": "DeFarm MCP server \u2014 seal, open, verify and ingest verifiable agri-traceability data from an AI agent. The DeFarm server stays cryptographically blind to sealed fields; private keys never leave the local keystore; credentials never flow through the model.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -29,7 +29,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@defarm/sdk": "github:defarm-repo/defarm-sdk-ts#5a6f810560c3c43ab819c22b4a06498772b2cf3b",
+    "@defarm/sdk": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.6.0",
     "zod": "^3.24.0"
   },
@@ -45,5 +45,8 @@
     "traceability",
     "hpke",
     "sealed-field"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
