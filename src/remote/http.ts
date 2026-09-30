@@ -7,6 +7,7 @@
  *   PORT=8787 DEFARM_API_BASE=https://gateway.defarm.net DEFARM_DOCS_BASE=https://docs.defarm.net node dist/remote/http.js
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { RemoteApi } from "./api.js";
@@ -16,6 +17,42 @@ export interface RemoteHttpOptions {
   apiBase: string;
   docsBase: string;
   fetchImpl?: typeof fetch | undefined;
+  /** Requisições por minuto por chave (default 120) e por IP (default 300). */
+  perKeyPerMinute?: number | undefined;
+  perIpPerMinute?: number | undefined;
+  now?: (() => number) | undefined;
+}
+
+/** Limite por janela fixa de 1 min, em memória (uma instância). Protege a API e o servidor. */
+export class RateLimiter {
+  private readonly hits = new Map<string, { windowStart: number; count: number }>();
+  constructor(
+    private readonly limit: number,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /** null = liberado; número = segundos até a próxima janela. */
+  check(key: string): number | null {
+    const t = this.now();
+    const w = this.hits.get(key);
+    if (!w || t - w.windowStart >= 60_000) {
+      this.hits.set(key, { windowStart: t, count: 1 });
+      if (this.hits.size > 50_000) this.sweep(t);
+      return null;
+    }
+    w.count += 1;
+    return w.count > this.limit ? Math.max(1, Math.ceil((w.windowStart + 60_000 - t) / 1000)) : null;
+  }
+
+  private sweep(t: number): void {
+    for (const [k, v] of this.hits) if (t - v.windowStart >= 60_000) this.hits.delete(k);
+  }
+}
+
+function clientIp(req: IncomingMessage): string {
+  const xff = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
+  return first || req.socket.remoteAddress || "unknown";
 }
 
 export function extractApiKey(req: IncomingMessage): string | null {
@@ -52,10 +89,17 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 }
 
 export function createRemoteHttpHandler(opts: RemoteHttpOptions) {
+  const byKey = new RateLimiter(opts.perKeyPerMinute ?? 120, opts.now);
+  const byIp = new RateLimiter(opts.perIpPerMinute ?? 300, opts.now);
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname === "/healthz") return json(res, 200, { status: "ok" });
     if (url.pathname !== "/mcp") return json(res, 404, { error: "not_found" });
+    const ipWait = byIp.check(clientIp(req));
+    if (ipWait !== null) {
+      res.setHeader("retry-after", String(ipWait));
+      return json(res, 429, { error: "rate_limited", retry_after_seconds: ipWait });
+    }
     if (req.method !== "POST") {
       // Sem estado: sem stream GET nem DELETE de sessão.
       res.setHeader("allow", "POST");
@@ -67,6 +111,12 @@ export function createRemoteHttpHandler(opts: RemoteHttpOptions) {
         error: "missing_api_key",
         message: "Send your DeFarm partner API key in the x-api-key header (or Authorization: Bearer).",
       });
+    }
+    // Pela chave (hash: a chave crua não fica nem na memória do limitador).
+    const keyWait = byKey.check(createHash("sha256").update(apiKey).digest("hex"));
+    if (keyWait !== null) {
+      res.setHeader("retry-after", String(keyWait));
+      return json(res, 429, { error: "rate_limited", retry_after_seconds: keyWait });
     }
     let body: unknown;
     try {
@@ -94,6 +144,8 @@ if (isMain) {
   const handler = createRemoteHttpHandler({
     apiBase: process.env.DEFARM_API_BASE ?? "https://gateway.defarm.net",
     docsBase: process.env.DEFARM_DOCS_BASE ?? "https://docs.defarm.net",
+    perKeyPerMinute: process.env.MCP_RATE_PER_KEY ? Number(process.env.MCP_RATE_PER_KEY) : undefined,
+    perIpPerMinute: process.env.MCP_RATE_PER_IP ? Number(process.env.MCP_RATE_PER_IP) : undefined,
   });
   createServer((req, res) => {
     handler(req, res).catch(() => {

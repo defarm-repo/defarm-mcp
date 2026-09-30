@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { createRemoteHttpHandler } from "../src/remote/http.js";
 import { REMOTE_TOOLS } from "../src/remote/tools.js";
 import { searchSections } from "../src/remote/docs.js";
+import { RateLimiter } from "../src/remote/http.js";
 
 const KEY = "chave-secreta-do-parceiro-123";
 const DFID = "DFID-BEEF-BR-2026-001372-2eed81";
@@ -142,6 +143,36 @@ describe("MCP remoto: governança", () => {
     expect(r.text).toContain("item_born");
     for (const leaked of ["12345678900", "-20.47", "-54.6", "Fulano"]) expect(r.text).not.toContain(leaked);
     expect(r.text).toContain("[omitido]");
+  });
+});
+
+describe("RateLimiter", () => {
+  it("libera até o limite, bloqueia depois e reabre na janela seguinte", () => {
+    let t = 1_000_000;
+    const rl = new RateLimiter(3, () => t);
+    expect([rl.check("k"), rl.check("k"), rl.check("k")]).toEqual([null, null, null]);
+    expect(rl.check("k")).toBeGreaterThan(0);
+    expect(rl.check("outra")).toBeNull();
+    t += 60_000;
+    expect(rl.check("k")).toBeNull();
+  });
+
+  it("429 com Retry-After pela chave", async () => {
+    const handler = createRemoteHttpHandler({ apiBase: "https://api.test", docsBase: "https://docs.test", fetchImpl: fakeFetch, perKeyPerMinute: 1 });
+    const srv = createServer((req, res) => void handler(req, res));
+    await new Promise<void>((r) => srv.listen(0, r));
+    const u = `http://127.0.0.1:${(srv.address() as AddressInfo).port}/mcp`;
+    const call = () =>
+      fetch(u, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "x-api-key": KEY },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+    expect((await call()).status).toBe(200);
+    const second = await call();
+    expect(second.status).toBe(429);
+    expect(Number(second.headers.get("retry-after"))).toBeGreaterThan(0);
+    await new Promise<void>((r) => srv.close(() => r()));
   });
 });
 
