@@ -41,50 +41,97 @@ const dfid = z
 
 export const PUBLIC_APP = "https://defarm.net";
 
-/**
- * Chaves de payload que não vão para o modelo (review #5): dado pessoal ou localização precisa.
- * O parceiro continua lendo tudo pela própria API; o que se evita é despejar isso num LLM de
- * terceiro por padrão. Casamento por nome, em qualquer nível do payload.
- */
-const SENSITIVE_KEY = /(^|_)(cpf|cnpj|rg|documento|email|e_mail|telefone|phone|celular|lat|latitude|lon|lng|longitude|coord|coordenadas|geo|endereco|address|proprietario|owner|produtor_nome|nome_produtor|owner_name)($|_)/i;
 
 /**
- * Conteúdo bruto de envio (o arquivo/linha como chegou) nunca vai ao modelo, em nenhuma ferramenta.
- * Atributos estruturados do animal vão, depois do corte de dado pessoal acima.
+ * Política de saída para o modelo (achado 2 + review do #9), FAIL-CLOSED, aplicada a toda
+ * ferramenta com dado de parceiro. A ingestão grava as chaves da linha em minúsculas
+ * (`cpfProdutor` vira `cpfprodutor`), então casar por fronteira de "_" deixava passar dado
+ * pessoal. Por isso a ordem é:
+ *   1. NEGA por substring na chave normalizada (vence tudo): cpf, email, nome, endereco, lat...
+ *   2. PERMITE só chaves conhecidas: estrutura da resposta, identificação do animal, tipo/data
+ *      de evento, fatos públicos (vacina, medicamento, motivo...), DFID, status, links.
+ *   3. Qualquer outra chave vira "[omitido]" (o nome fica, para o modelo saber que existe).
+ * Valores de identificador só passam se o tipo for de ANIMAL (SISBOV, chip...); CPF/CNPJ/IE e
+ * identificadores de propriedade (CAR, CCIR...) saem como "[omitido]". Em todo texto, número
+ * com cara de CPF/CNPJ e e-mail também são cortados.
  */
-const RAW_PAYLOAD_KEY = /^(payload_text|raw_payload|raw_row|raw_rows|payload_bytes|raw_body)$/i;
+const norm = (k: string) => k.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-/**
- * Política única de saída para o modelo, aplicada a TODA ferramenta com dado de parceiro: tira o
- * conteúdo bruto de envio e corta dado pessoal/localização, em qualquer nível.
- */
+export const DENY_SUBSTRINGS = [
+  "cpf", "cnpj", "email", "telefone", "celular", "phone", "fone", "contato", "contact",
+  "nome", "name", "documento", "document", "endereco", "address", "rg", "lat", "lon", "lng",
+  "coordenad", "geo", "car", "owner", "proprietario", "produtor", "fazenda", "propriedade",
+] as const;
+
+export const ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  // estrutura das respostas
+  "items", "item", "events", "identifiers", "canonicalidentifier", "payload", "metadata", "data",
+  "publicevents", "circuitevents", "rows", "errors", "summary", "issues", "routes", "eventspreview",
+  "assetreference", "resultsummary", "progress", "count", "nextcursor", "id",
+  // animal e identificadores
+  "dfid", "itemid", "valuechain", "country", "year", "artifacttype", "status", "identifiertype",
+  "identifiervalue", "value", "iscanonical", "routetype", "routevalue", "circuitid",
+  "numeroelementoidentificacao", "numeroelementoidentificacaosubstituido", "substituto", "sisbov",
+  "chip", "especie", "species", "sexo", "sex", "raca", "breed", "mesnascimento", "anonascimento",
+  "lote", "peso", "weight", "tipohistorico",
+  // eventos e fatos públicos
+  "eventtype", "occurredat", "createdat", "updatedat", "registeredat", "processedat", "confirmedat",
+  "visibility", "sourcetype", "source", "trustlevel", "trustscore", "isduplicate", "vaccine",
+  "vacina", "vacinaaplicada", "medication", "medicamento", "medicamentoaplicado", "treatment",
+  "tratamento", "motivo", "motivobaixa", "reason", "gta", "gtanumber", "numerogta",
+  // ancoragem e links
+  "transactionhash", "nfttxhash", "ledgernumber", "explorerurl", "gatewayurl", "contentid",
+  "anchortype", "chaintype", "storagetype", "version", "ispinned", "signatureverified",
+  "publicpage", "verifypage",
+  // ingestão
+  "reasoncode", "message", "errormessage", "rowindex", "partnerreference", "dryrun", "wouldcreate",
+  "totalrows", "processedrows", "unresolvedrows", "itemscreated", "itemsenriched", "eventsdetected",
+  "createdcircuits", "impactedcircuits", "ingestionid", "percentcomplete", "chunkstotal",
+  "chunkscompleted", "occurrences", "severity", "firstseenat", "lastseenat", "payloadsizebytes",
+  "contenttype", "intakemode",
+]);
+
+/** Datas de histórico PNIB (dataVacinacao, dataSaida...): sempre fato datado, permitidas. */
+const DATE_KEY = /^data[a-z]+$/;
+
+/** Tipos de identificador cujo VALOR pode ir ao modelo: os do animal. */
+const ANIMAL_ID_TYPES = new Set(["sisbov", "chip", "rfid", "brinco", "eid", "numeroelementoidentificacao", "lotecode", "lote", "dfid"]);
+const ID_TYPE_KEYS = ["identifier_type", "identifierType", "route_type", "routeType"];
+const ID_VALUE_KEYS = new Set(["value", "identifiervalue", "routevalue"]);
+
+const OMIT = "[omitido]";
+const CPF_RE = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g;
+const CNPJ_RE = /\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g;
+const EMAIL_RE = /[^\s@"]+@[^\s@"]+\.[a-z]{2,}/gi;
+
+function keyVerdict(k: string): "deny" | "allow" | "unknown" {
+  const n = norm(k);
+  if (DENY_SUBSTRINGS.some((d) => n.includes(d))) return "deny";
+  if (ALLOWED_KEYS.has(n) || DATE_KEY.test(n)) return "allow";
+  return "unknown";
+}
+
+function scrubText(v: string): string {
+  return v.replace(CNPJ_RE, OMIT).replace(CPF_RE, OMIT).replace(EMAIL_RE, OMIT);
+}
+
 export function forModel(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(forModel);
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (RAW_PAYLOAD_KEY.test(k)) continue;
-      out[k] = isSensitiveKey(k) ? "[omitido]" : forModel(v);
+  if (typeof value === "string") return scrubText(value);
+  if (!value || typeof value !== "object") return value;
+  const obj = value as Record<string, unknown>;
+  const typeKey = ID_TYPE_KEYS.find((t) => typeof obj[t] === "string");
+  const idTypeIsAnimal = typeKey ? ANIMAL_ID_TYPES.has(norm(String(obj[typeKey]))) : true;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const verdict = keyVerdict(k);
+    if (verdict !== "allow") {
+      out[k] = OMIT;
+      continue;
     }
-    return out;
+    out[k] = !idTypeIsAnimal && ID_VALUE_KEYS.has(norm(k)) ? OMIT : forModel(v);
   }
-  return value;
-}
-
-function isSensitiveKey(k: string): boolean {
-  return SENSITIVE_KEY.test(k.replace(/([a-z])([A-Z])/g, "$1_$2"));
-}
-
-export function redactSensitive(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactSensitive);
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = isSensitiveKey(k) ? "[omitido]" : redactSensitive(v);
-    }
-    return out;
-  }
-  return value;
+  return out;
 }
 
 export const REMOTE_TOOLS: RemoteToolDef[] = [
@@ -166,7 +213,7 @@ export const REMOTE_TOOLS: RemoteToolDef[] = [
     schema: { limit: z.number().int().min(1).max(100).optional() },
     handler: async (api, a) => {
       const r = (await api.get("/v1/partner/ingestions/raw", { limit: (a.limit as number) ?? 20 })) as { rows?: Record<string, unknown>[] };
-      // Só metadados: o conteúdo bruto (payload_text) sai na política forModel, aplicada no servidor.
+      // Só metadados: o conteúdo bruto (payload_text) não é chave permitida e sai como "[omitido]" em forModel.
       return { rows: r?.rows ?? [] };
     },
     partnerData: true,

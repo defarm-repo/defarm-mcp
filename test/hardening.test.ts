@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { clientIp, createRemoteHttpHandler } from "../src/remote/http.js";
-import { REMOTE_TOOLS, UNTRUSTED_NOTICE, forModel } from "../src/remote/tools.js";
+import { ALLOWED_KEYS, DENY_SUBSTRINGS, REMOTE_TOOLS, UNTRUSTED_NOTICE, forModel } from "../src/remote/tools.js";
 
 const KEY = "chave-de-teste-hardening";
 const DFID = "DFID-BEEF-BR-2026-001416-7566ee";
@@ -87,10 +87,76 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(text).toContain(`https://defarm.net/i/${DFID}`);
   });
 
-  it("forModel tira payload bruto e corta chave sensível em qualquer nível", () => {
+  it("forModel corta conteúdo bruto e chave desconhecida, mantém o fato", () => {
     expect(forModel({ rows: [{ id: "r1", payload_text: "x", nested: { ownerName: "F", vacina: "B" } }] })).toEqual({
-      rows: [{ id: "r1", nested: { ownerName: "[omitido]", vacina: "B" } }],
+      rows: [{ id: "r1", payload_text: "[omitido]", nested: "[omitido]" }],
     });
+  });
+
+  // Review do #9: a ingestão grava as chaves em minúsculas, sem "_" (como no engines#670).
+  const LOWERCASED_PERSONAL = {
+    cpfprodutor: "123.456.789-00",
+    emailcontato: "fulano@exemplo.com",
+    telefonecelular: "+55 67 99999-0000",
+    nomeproprietario: "Fulano de Tal",
+    documentoproprietario: "RG 1234567",
+    enderecofazenda: "Rodovia MS-040 km 12",
+    cpf_do_produtor: "12345678900",
+    cpfProdutor: "12345678900",
+  };
+  const LEAKS = ["123.456.789-00", "fulano@exemplo.com", "99999-0000", "Fulano de Tal", "1234567", "MS-040", "12345678900"];
+
+  it("chaves pessoais em minúsculas, em qualquer nível, saem como [omitido]", () => {
+    const out = forModel({
+      item: {
+        dfid: DFID,
+        metadata: { ...LOWERCASED_PERSONAL, vacinaaplicada: "BRUCELOSE", datavacinacao: "2025-06-15" },
+      },
+      events: [{ event_type: "item_vaccinated", payload: { ...LOWERCASED_PERSONAL, extra: { ...LOWERCASED_PERSONAL } } }],
+    });
+    const text = JSON.stringify(out);
+    for (const leaked of LEAKS) expect(text).not.toContain(leaked);
+    // o fato público e a data passam
+    expect(text).toContain("BRUCELOSE");
+    expect(text).toContain("2025-06-15");
+    expect(text).toContain("item_vaccinated");
+  });
+
+  it("chave desconhecida é fechada por padrão (fail-closed)", () => {
+    expect(forModel({ campo_novo_do_parceiro: "qualquer coisa", sisbov: "105500497219998" })).toEqual({
+      campo_novo_do_parceiro: "[omitido]",
+      sisbov: "105500497219998",
+    });
+  });
+
+  it("negação vence o padrão de data (dataNascimentoProprietario)", () => {
+    expect(forModel({ datanascimentoproprietario: "1970-01-01", dataemailcontato: "x", datavacinacao: "2025-06-15" })).toEqual({
+      datanascimentoproprietario: "[omitido]",
+      dataemailcontato: "[omitido]",
+      datavacinacao: "2025-06-15",
+    });
+  });
+
+  it("valor de identificador só passa se for do animal", () => {
+    const out = forModel({
+      identifiers: [
+        { identifier_type: "SISBOV", value: "105500497219998" },
+        { identifier_type: "CPF", value: "12345678900" },
+        { identifier_type: "car", value: "MS-5003207-ABCD" },
+      ],
+      routes: [{ route_type: "cnpj", route_value: "12345678000199", circuit_id: "c1" }],
+    }) as { identifiers: { value: string }[]; routes: { route_value: string; circuit_id: string }[] };
+    expect(out.identifiers.map((i) => i.value)).toEqual(["105500497219998", "[omitido]", "[omitido]"]);
+    expect(out.routes[0]).toEqual({ route_type: "cnpj", route_value: "[omitido]", circuit_id: "c1" });
+  });
+
+  it("texto livre perde CPF, CNPJ e e-mail; SISBOV de 15 dígitos fica", () => {
+    const out = forModel({ message: "linha do produtor 123.456.789-00 (12.345.678/0001-99, a@b.com), animal 105500497219998" });
+    expect(out).toEqual({ message: "linha do produtor [omitido] ([omitido], [omitido]), animal 105500497219998" });
+  });
+
+  it("nenhuma chave permitida colide com a lista de negação", () => {
+    expect([...ALLOWED_KEYS].filter((k) => DENY_SUBSTRINGS.some((d) => k.includes(d)))).toEqual([]);
   });
 });
 
