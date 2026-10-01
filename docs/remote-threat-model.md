@@ -67,6 +67,13 @@ digits in emoji, numbers in words in another language, and so on. That author al
 data and has the API and CSV exports. The MCP filter is not the boundary against them, and the
 structural controls above are meant to keep accidents out, not to stop a determined author.
 
+**Declared identifier types are trusted.** A 15-digit non-animal number (for example a CNS health
+card number) that the partner itself declares as `sisbov` or `chip` matches the identifier format
+and passes. The CNS check digit cannot separate the two: about 9.1% of 15-digit numbers starting
+with 1 pass it, so using it would also hide real PNIB numbers. The filter trusts the type the
+partner declares for an identifier; personal data placed in an animal identifier field is the
+partner's responsibility, as with deliberate obfuscation.
+
 ## Prompt injection
 
 Partner-written content can contain text aimed at the reader's assistant. This is mitigated by
