@@ -74,7 +74,7 @@ export const ALLOWED_KEYS: ReadonlySet<string> = new Set([
   "dfid", "itemid", "valuechain", "country", "year", "artifacttype", "status", "identifiertype",
   "identifiervalue", "value", "iscanonical", "routetype", "routevalue", "circuitid",
   "numeroelementoidentificacao", "numeroelementoidentificacaosubstituido", "substituto", "sisbov",
-  "chip", "especie", "species", "sexo", "sex", "raca", "breed", "mesnascimento", "anonascimento",
+  "chip", "rfid", "brinco", "especie", "species", "sexo", "sex", "raca", "breed", "mesnascimento", "anonascimento",
   "lote", "peso", "weight", "tipohistorico",
   // eventos e fatos públicos
   "eventtype", "occurredat", "createdat", "updatedat", "registeredat", "processedat", "confirmedat",
@@ -201,14 +201,70 @@ function scrubText(v: string): string {
 }
 
 /**
- * Valores que nunca passam pelo scrub de texto: identificador do animal (um SISBOV de 14 dígitos
- * pode ter DV de CNPJ válido) e ids/hashes gerados pela DeFarm. São dado estruturado, não texto livre.
+ * Isenção do scrub de texto, por FORMATO (review do #9, 4ª rodada): o nome da chave vem do
+ * parceiro (coluna vira metadata, payload de evento é livre), então a chave sozinha não prova
+ * nada. Um valor só passa cru quando ele INTEIRO casa o formato esperado para a chave; fora
+ * disso, vai pelo scrub normal. Formatos conferidos com o engines (identifier_resolver.rs):
+ * SISBOV ^(\d{14}|\d{15}|BR\d{15})$; chip/rfid canônico = 15 dígitos (ISO 11784). Brinco não
+ * tem formato no engines, então não tem isenção (passa, mas com scrub).
  */
-const NO_SCRUB_KEYS: ReadonlySet<string> = new Set([
-  "sisbov", "numeroelementoidentificacao", "numeroelementoidentificacaosubstituido", "chip", "rfid",
-  "brinco", "dfid", "id", "itemid", "circuitid", "ingestionid", "transactionhash", "nfttxhash",
-  "contentid", "explorerurl", "gatewayurl", "publicpage", "verifypage",
-]);
+const SISBOV_FMT = /^(\d{14}|\d{15}|BR\d{15})$/;
+const CHIP_FMT = /^\d{15}$/;
+const DFID_FMT = /^DFID-[A-Z]{1,7}-[A-Z]{2}-\d{4}-\d{6}-[0-9a-f]{6}$/;
+const UUID_FMT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const HEX64_FMT = /^[0-9a-f]{64}$/i;
+const CID_FMT = /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{50,})$/;
+
+const FORMAT_BY_KEY: Record<string, RegExp> = {
+  sisbov: SISBOV_FMT,
+  numeroelementoidentificacao: SISBOV_FMT,
+  numeroelementoidentificacaosubstituido: SISBOV_FMT,
+  chip: CHIP_FMT,
+  rfid: CHIP_FMT,
+  dfid: DFID_FMT,
+  id: UUID_FMT,
+  itemid: UUID_FMT,
+  circuitid: UUID_FMT,
+  ingestionid: UUID_FMT,
+  transactionhash: HEX64_FMT,
+  nfttxhash: HEX64_FMT,
+  contentid: CID_FMT,
+};
+
+/** Formato do VALOR de um identificador tipado (`{identifier_type, value}`), pelo tipo. */
+const FORMAT_BY_ID_TYPE: Record<string, RegExp> = {
+  sisbov: SISBOV_FMT,
+  numeroelementoidentificacao: SISBOV_FMT,
+  chip: CHIP_FMT,
+  rfid: CHIP_FMT,
+  dfid: DFID_FMT,
+};
+
+const URL_KEYS = new Set(["explorerurl", "gatewayurl", "publicpage", "verifypage"]);
+const TRUSTED_HOSTS = new Set(["defarm.net", "www.defarm.net", "docs.defarm.net", "stellar.expert", "gateway.pinata.cloud", "ipfs.io"]);
+
+/** URL de host confiável, sem query/fragmento, e caminho que o scrub não altera; senão, scrub. */
+function urlForModel(v: string): string {
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    return scrubText(v);
+  }
+  if (u.protocol !== "https:" || !TRUSTED_HOSTS.has(u.hostname) || u.username || u.password) return scrubText(v);
+  const clean = `${u.origin}${u.pathname}`;
+  return scrubText(decodeURIComponent(u.pathname)) === decodeURIComponent(u.pathname) ? clean : scrubText(clean);
+}
+
+function scalarForModel(n: string, v: string, idType: string | undefined): string {
+  if (idType !== undefined && ID_VALUE_KEYS.has(n)) {
+    const fmt = FORMAT_BY_ID_TYPE[idType];
+    return fmt && fmt.test(v) ? v : scrubText(v);
+  }
+  if (URL_KEYS.has(n)) return urlForModel(v);
+  const fmt = FORMAT_BY_KEY[n];
+  return fmt && fmt.test(v) ? v : scrubText(v);
+}
 
 export function forModel(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(forModel);
@@ -226,7 +282,7 @@ export function forModel(value: unknown): unknown {
     }
     const n = norm(k);
     if (ID_VALUE_KEYS.has(n) && !idTypeIsAnimal) out[k] = OMIT;
-    else if (typeof v === "string" && (NO_SCRUB_KEYS.has(n) || (ID_VALUE_KEYS.has(n) && typeKey))) out[k] = v;
+    else if (typeof v === "string") out[k] = scalarForModel(n, v, typeKey ? norm(String(obj[typeKey])) : undefined);
     else out[k] = forModel(v);
   }
   return out;

@@ -234,6 +234,59 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     });
   });
 
+  // 4ª rodada: a chave vem do parceiro; isenção só com o VALOR no formato esperado.
+  const T = "João… CPF 529.982.247-25 tel (67) 99999-0000 joao@ex.com";
+  const leaksIn = (out: unknown) => {
+    const text = JSON.stringify(out);
+    return ["529.982.247-25", "99999-0000", "joao@ex.com"].filter((x) => text.includes(x));
+  };
+
+  it("vetor 1: metadata.sisbov com texto livre", () => expect(leaksIn(forModel({ metadata: { sisbov: T } }))).toEqual([]));
+  it("vetor 2: metadata.chip com texto livre", () => expect(leaksIn(forModel({ metadata: { chip: T } }))).toEqual([]));
+  it("vetor 3: metadata.numeroelementoidentificacaosubstituido com texto livre", () =>
+    expect(leaksIn(forModel({ metadata: { numeroelementoidentificacaosubstituido: T } }))).toEqual([]));
+  it("vetor 4: payload.id com texto livre", () => expect(leaksIn(forModel({ payload: { id: T } }))).toEqual([]));
+  it("vetor 5: payload.dfid com texto livre", () => expect(leaksIn(forModel({ payload: { dfid: T } }))).toEqual([]));
+  it("vetor 6: payload {identifier_type: SISBOV, value} com texto livre", () =>
+    expect(leaksIn(forModel({ payload: { identifier_type: "SISBOV", value: T } }))).toEqual([]));
+  it("vetor 7: query de payload.explorer_url", () => {
+    const out = forModel({ payload: { explorer_url: `https://stellar.expert/explorer/public/tx/abc?nota=${encodeURIComponent(T)}` } });
+    expect(leaksIn(out)).toEqual([]);
+    expect(out).toEqual({ payload: { explorer_url: "https://stellar.expert/explorer/public/tx/abc" } });
+  });
+
+  it("controle: motivo com o mesmo texto é filtrado", () => expect(leaksIn(forModel({ motivo: T }))).toEqual([]));
+
+  it("controle: valores no formato esperado passam crus", () => {
+    const v = {
+      sisbov: "11222333000181", // 14 dígitos com DV de CNPJ válido
+      numeroelementoidentificacao: "BR105500497219998",
+      chip: "982000123456789",
+      rfid: "982000123456789",
+      dfid: "DFID-BEEF-BR-2026-001415-2797eb",
+      id: "cd27abca-4316-4d5d-b271-2afcba690864",
+      transaction_hash: "070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76",
+      content_id: "QmPPpa5gmKf71nsXFBTRCdpnqypWSJVbxLeg4h2NVFAGio",
+      gateway_url: "https://gateway.pinata.cloud/ipfs/QmPPpa5gmKf71nsXFBTRCdpnqypWSJVbxLeg4h2NVFAGio",
+      public_page: "https://defarm.net/i/DFID-BEEF-BR-2026-001415-2797eb",
+    };
+    expect(forModel(v)).toEqual(v);
+    expect(forModel({ identifiers: [{ identifier_type: "SISBOV", value: "11222333000181" }] })).toEqual({
+      identifiers: [{ identifier_type: "SISBOV", value: "11222333000181" }],
+    });
+  });
+
+  it("controle: URL de host não confiável é tratada como texto", () => {
+    expect(forModel({ explorer_url: "https://evil.example/x?tel=(67) 99999-0000" })).toEqual({
+      explorer_url: "https://evil.example/x?tel=[omitido]",
+    });
+  });
+
+  it("brinco e rfid aparecem (allowlist), brinco com scrub por não ter formato no engines", () => {
+    expect(forModel({ brinco: "A-123", rfid: "982000123456789" })).toEqual({ brinco: "A-123", rfid: "982000123456789" });
+    expect(leaksIn(forModel({ brinco: T, rfid: T }))).toEqual([]);
+  });
+
   it("fato público com 'nome' na chave passa (allowlist antes da negação); o resto continua negado", () => {
     expect(
       forModel({ nomeVacina: "BRUCELOSE B19", nome_medicamento: "IVERMECTINA", principioAtivo: "ivermectina", nomeProdutor: "Fulano" }),
