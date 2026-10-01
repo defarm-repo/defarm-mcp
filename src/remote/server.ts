@@ -1,7 +1,9 @@
+import { DefarmApiError } from "./api.js";
+import { forModel, scopeErrorMessage, untrustedEnvelope } from "./tools.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { DefarmApiError, type RemoteApi } from "./api.js";
-import { REMOTE_TOOLS, forModel, scopeErrorMessage, untrustedEnvelope } from "./tools.js";
+import type { RemoteApi } from "./api.js";
+import { REMOTE_TOOLS } from "./tools.js";
 import { DOC_RESOURCES, fetchDoc, searchSections } from "./docs.js";
 
 export interface RemoteServerOptions {
