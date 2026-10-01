@@ -152,9 +152,9 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(out.routes[0]).toEqual({ route_type: "cnpj", route_value: "[omitido]", circuit_id: "c1" });
   });
 
-  it("texto livre perde CPF, CNPJ e e-mail; SISBOV de 15 dígitos fica", () => {
-    const out = forModel({ message: "linha do produtor 123.456.789-00 (12.345.678/0001-99, a@b.com), animal 105500497219998" });
-    expect(out).toEqual({ message: "linha do produtor [omitido] ([omitido], [omitido]), animal 105500497219998" });
+  it("texto livre perde CPF, CNPJ e e-mail e mantém o resto", () => {
+    const out = forModel({ message: "linha do produtor 123.456.789-00 (12.345.678/0001-99, a@b.com), animal da linha 3" });
+    expect(out).toEqual({ message: "linha do produtor [omitido] ([omitido], [omitido]), animal da linha 3" });
   });
 
   const scrub = (v: string) => (forModel({ message: v }) as { message: string }).message;
@@ -176,18 +176,22 @@ describe("2. uma política de saída para todas as ferramentas", () => {
       expect(scrub(`ligar ${phone} amanhã`)).toBe("ligar [omitido] amanhã");
   });
 
-  it("CPF/CNPJ: formatado ou com DV válido sai; dígitos sem DV válido ficam (SISBOV de 14/15)", () => {
+  it("CPF/CNPJ: formatado ou com DV válido sai; número de animal em texto livre sai inteiro (6ª rodada)", () => {
     expect(scrub("cpf 529.982.247-25")).toBe("cpf [omitido]");
     expect(scrub("cpf 52998224725")).toBe("cpf [omitido]"); // DV válido
     expect(scrub("cnpj 11.222.333/0001-81")).toBe("cnpj [omitido]");
     expect(scrub("cnpj 11222333000181")).toBe("cnpj [omitido]"); // DV válido
-    expect(scrub("animal 07695743932951")).toBe("animal 07695743932951"); // 14 dígitos, DV de CNPJ inválido
-    expect(scrub("animal 105500497219998")).toBe("animal 105500497219998");
-    expect(scrub("numero 12345678900")).toBe("numero 12345678900"); // 11 dígitos, DV de CPF inválido
+    // não é CPF/CNPJ (camada 1 não corta), mas 8+ dígitos em texto livre saem inteiros;
+    // o número do animal chega ao modelo pela chave própria (sisbov), isenta por formato
+    expect(scrub("animal 07695743932951")).toBe("[omitido]");
+    expect(scrub("animal 105500497219998")).toBe("[omitido]");
+    expect(forModel({ sisbov: "07695743932951" })).toEqual({ sisbov: "07695743932951" });
+    // 11 dígitos sem DV válido: não é CPF, mas 8+ dígitos em texto livre é "cara de código" (6ª rodada)
+    expect(scrub("numero 12345678900")).toBe("[omitido]");
   });
 
   it("não corta DFID, datas nem número de ledger no texto; hash e id não passam pelo scrub", () => {
-    const keep = "DFID-BEEF-BR-2026-001415-2797eb 2025-06-15 20250615 ledger 64706496";
+    const keep = "DFID-BEEF-BR-2026-001415-2797eb 2025-06-15";
     expect(scrub(keep)).toBe(keep);
     const hash = "070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76";
     expect(forModel({ transaction_hash: hash, dfid: "DFID-BEEF-BR-2026-001415-2797eb" })).toEqual({
@@ -209,14 +213,19 @@ describe("2. uma política de saída para todas as ferramentas", () => {
 
   it("(c) intervalo de anos não é telefone", () => {
     expect(scrub("safra 2024-2025")).toBe("safra 2024-2025");
-    expect(scrub("em 2025-06-15 20250615")).toBe("em 2025-06-15 20250615"); // o 15 da data não vira DDD
+    // o 15 da data não vira DDD; a data compacta (8 dígitos) cai na regra de cara de código
+    expect(scrub("em 2025-06-15 20250615")).toBe("[omitido]");
+    expect(scrub("em 2025-06-15 dose 2")).toBe("em 2025-06-15 dose 2");
   });
 
   it("(d) DDD inexistente ou assinante fora do formato não é telefone", () => {
-    expect(scrub("lote 1234 5678")).toBe("lote 1234 5678");
-    expect(scrub("protocolo 10987654321")).toBe("protocolo 10987654321");
-    expect(scrub("(20) 99999-0000")).toBe("(20) 99999-0000"); // DDD 20 não existe
-    expect(scrub("(67) 99999-0000")).toBe("[omitido]");
+    // não são telefone, mas 8+ dígitos em texto livre saem inteiros pela regra estrutural
+    expect(scrub("lote 1234 5678")).toBe("[omitido]");
+    expect(scrub("protocolo 10987654321")).toBe("[omitido]");
+    // DDD 20 não existe: a camada de telefone não reconhece, e o valor inteiro sai pela regra de
+    // 8+ dígitos; com DDD real, só o telefone é cortado e o resto do texto fica.
+    expect(scrub("ligue (20) 99999-0000 hoje")).toBe("[omitido]");
+    expect(scrub("ligue (67) 99999-0000 hoje")).toBe("ligue [omitido] hoje");
   });
 
   it("(e) SISBOV de 14 dígitos com DV de CNPJ válido nunca some do identificador do animal", () => {
@@ -289,6 +298,63 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     // formato checado na forma normalizada: SISBOV de 14 com DV de CNPJ válido, em largura total
     expect(forModel({ sisbov: "１１２２２３３３０００１８１" })).toEqual({ sisbov: "11222333000181" });
   });
+
+  // 6ª rodada: ofuscação deliberada. Não se persegue cada codificação; o que tem cara de código
+  // sai inteiro (ver docs/remote-threat-model.md).
+  const OBFUSCATED: Record<string, string> = {
+    "percent 4 camadas": "cpf%25252520529.982.247-25",
+    "%u": "cpf %u0035%u0032%u0039%u002E%u0039%u0038%u0032",
+    "entidade decimal": "cpf &#53;&#50;&#57;&#46;&#57;&#56;&#50;&#46;&#50;&#52;&#55;&#45;&#50;&#53;",
+    "entidade hex": "cpf &#x35;&#x32;&#x39;&#x2E;&#x39;&#x38;&#x32;",
+    "escape \\u": "cpf \\u0035\\u0032\\u0039\\u0039\\u0038",
+    "base64 do CPF": "NTI5Ljk4Mi4yNDctMjU=",
+    "base64 da frase": "Q1BGIDUyOS45ODIuMjQ3LTI1IHRlbCAoNjcpIDk5OTk5LTAwMDA=",
+    "dígitos com espaço": "cpf 5 2 9 9 8 2 2 4 7 2 5",
+    "dígitos com largura zero": "cpf 5\u200B2\u200B9\u200B9\u200B8\u200B2\u200B2\u200B4\u200B7\u200B2\u200B5",
+    "por extenso": "cpf cinco dois nove nove oito dois dois quatro sete dois cinco",
+    "percent malformado": "dado %ZZ%35%32%39%39%38",
+    "telefone por extenso": "ligue seis sete nove nove nove nove nove zero zero zero zero",
+  };
+  for (const [name, v] of Object.entries(OBFUSCATED)) {
+    it(`ofuscação sai omitida: ${name}`, () => expect(scrub(v)).toBe("[omitido]"));
+  }
+
+  it("teto de tamanho em texto livre; mensagem da API tem teto maior", () => {
+    const long = "observação ".repeat(20).trim();
+    const out = (forModel({ motivo: long }) as { motivo: string }).motivo;
+    expect(out.endsWith("…[truncado]")).toBe(true);
+    expect(out.length).toBe(120 + "…[truncado]".length);
+    const msg = "the replaced number is not registered, so there is no animal to link the new number to. Send the animal's history under the replaced number first, in an earlier request.";
+    expect((forModel({ message: msg }) as { message: string }).message).toBe(msg);
+  });
+
+  it("identificador e data em chave própria passam; o mesmo número em texto livre sai", () => {
+    const v = {
+      sisbov: "105500497219998",
+      chip: "982000123456789",
+      dfid: "DFID-BEEF-BR-2026-001415-2797eb",
+      transaction_hash: "070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76",
+      id: "cd27abca-4316-4d5d-b271-2afcba690864",
+      created_at: "2026-10-01T01:29:26.958087Z",
+      datavacinacao: "2025-06-15",
+    };
+    expect(forModel(v)).toEqual(v);
+    expect(scrub("chip 982000123456789")).toBe("[omitido]");
+    expect(scrub("baixa do animal 105500497219998 por venda")).toBe("[omitido]");
+  });
+
+  const LEGIT: Record<string, string> = {
+    safra: "safra 2024-2025",
+    vacina: "BRUCELOSE B19",
+    dose: "dose 2 ml",
+    "data ISO": "2025-06-15",
+    "data e hora ISO": "2025-06-15T10:30:00Z",
+    motivo: "MORTE NATURAL - picada de cobra",
+    medicamento: "IVERMECTINA 1% injetável",
+  };
+  for (const [name, v] of Object.entries(LEGIT)) {
+    it(`controle legítimo passa: ${name}`, () => expect(scrub(v)).toBe(v));
+  }
 
   it("controle: motivo com o mesmo texto é filtrado", () => expect(leaksIn(forModel({ motivo: T }))).toEqual([]));
 

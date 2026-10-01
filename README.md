@@ -17,6 +17,8 @@ client-side and the DeFarm server is **structurally blind** to them.
 - **Safe defaults are inherited from the SDK**: sealing is private and self-addressed unless
   explicitly addressed; the crypto suite is fixed, never a choice.
 
+The remote server's output filter and its limits are described in [docs/remote-threat-model.md](docs/remote-threat-model.md).
+
 ## Setup
 
 ```jsonc

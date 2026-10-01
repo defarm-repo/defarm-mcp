@@ -3,6 +3,13 @@
  * (simulação que não grava). NÃO há ferramenta de escrita: ingerir de verdade continua sendo do
  * sistema do parceiro (SDK/API), não do assistente de IA. Selagem e chaves privadas ficam no MCP
  * local (stdio), nunca num servidor hospedado.
+ *
+ * MODELO DE AMEAÇA da política de saída (`forModel`), detalhado em docs/remote-threat-model.md:
+ * - protege contra PII ACIDENTAL vinda do parceiro indo para o provedor do LLM;
+ * - ofuscação deliberada por quem escreveu o dado fica FORA de escopo (esse autor já tem a API e
+ *   o CSV); contra ela há só controles estruturais baratos (código vira omitido, teto de tamanho);
+ * - prompt injection é mitigado pelo envelope de dado não confiável, não pelo filtro;
+ * - isolamento entre workspaces é garantido pela API da DeFarm, não pelo MCP.
  */
 import { z } from "zod";
 import type { RemoteApi } from "./api.js";
@@ -216,10 +223,10 @@ export function normalizeDigits(v: string): string {
   });
 }
 
-/** Decodifica percent-encoding (e `+` de formulário) até estabilizar; erro = mantém o que tem. */
+/** Decodifica percent-encoding (e `+` de formulário) até estabilizar (até 10 camadas); erro = mantém o que tem. */
 function decodeLayers(v: string): string {
   let cur = v;
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 10; i++) {
     let next: string;
     try {
       next = decodeURIComponent(cur.replace(/\+/g, " "));
@@ -233,10 +240,21 @@ function decodeLayers(v: string): string {
 }
 
 /**
- * Scrub de texto livre. Roda sobre os dígitos normalizados; se a versão DECODIFICADA (percent-
- * encoding) tiver PII que a codificada esconde (o 0 de %20 colado no número), o valor inteiro sai.
+ * Texto livre (tudo que não é identificador/id/hash/URL isento por formato), em três camadas:
+ *   1. scrub de PII acidental: CPF, CNPJ, telefone e e-mail em formatação humana comum, também na
+ *      versão percent-decodificada;
+ *   2. valor com cara de CÓDIGO sai inteiro (`codeLike`): ofuscação não se vence por regex, então
+ *      o que parece codificado nem chega ao modelo;
+ *   3. teto de tamanho: fatos reais (vacina, motivo, medicamento) são curtos.
+ * Ver o modelo de ameaça em docs/remote-threat-model.md.
  */
-function scrubText(v: string): string {
+const FREE_TEXT_MAX = 120;
+/** Mensagens da API da DeFarm (erro por linha, reason) são mais longas e geradas por nós. */
+const MESSAGE_KEYS = new Set(["message", "errormessage"]);
+const MESSAGE_MAX = 400;
+const TRUNCATED = "…[truncado]";
+
+function scrubText(v: string, key?: string): string {
   const plain = normalizeDigits(v);
   const scrubbed = scrubPlain(plain);
   const decoded = normalizeDigits(decodeLayers(plain));
@@ -245,10 +263,52 @@ function scrubText(v: string): string {
   if (decoded !== plain && omitCount(scrubPlain(decoded)) - omitCount(decoded) > omitCount(scrubbed) - omitCount(plain)) {
     return OMIT;
   }
-  return scrubbed;
+  if (codeLike(scrubbed) || codeLike(scrubPlain(decoded))) return OMIT;
+  const max = key !== undefined && MESSAGE_KEYS.has(key) ? MESSAGE_MAX : FREE_TEXT_MAX;
+  return scrubbed.length > max ? scrubbed.slice(0, max) + TRUNCATED : scrubbed;
 }
 
 const omitCount = (s: string) => s.split(OMIT).length - 1;
+
+const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+const ESCAPES = /&#x?[0-9a-f]+;?|%u[0-9a-f]{4}|\\u[0-9a-f]{4}|\\x[0-9a-f]{2}/i;
+const LEFTOVER_PERCENT = /%[0-9a-f]{2}/i;
+// Fatos com dígito que são legítimos e não devem contar para o teto de dígitos.
+const BENIGN_DIGITS = [
+  /\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?/g, // data ISO
+  /\b\d{2}\/\d{2}\/\d{4}\b/g, // data BR
+  /\b(?:19|20)\d{2}\s*[-/]\s*(?:19|20)\d{2}\b/g, // safra 2024-2025
+  /DFID-[A-Z]{1,7}-[A-Z]{2}-\d{4}-\d{6}-[0-9a-f]{6}/g,
+];
+const DIGIT_WORDS: Record<string, string> = {
+  zero: "0", um: "1", uma: "1", dois: "2", duas: "2", tres: "3", "três": "3", quatro: "4", cinco: "5",
+  seis: "6", sete: "7", oito: "8", nove: "9", one: "1", two: "2", three: "3", four: "4", five: "5",
+  six: "6", seven: "7", eight: "8", nine: "9",
+};
+const DIGIT_WORD_RE = new RegExp(`(?<![\\p{L}])(${Object.keys(DIGIT_WORDS).join("|")})(?![\\p{L}])`, "giu");
+
+/** Base64/hex contíguo: token longo do alfabeto que mistura letra e dígito, ou tem +, / ou =. */
+function looksEncodedToken(t: string): boolean {
+  if (t.length < 16) return false;
+  if (/[+/=]/.test(t)) return true;
+  return /\d/.test(t) && /[A-Za-z]/.test(t);
+}
+
+/**
+ * Valor com cara de código: escape/entidade, %-encoding que sobra depois de decodificar,
+ * token base64/hex de 16+, ou 8+ dígitos seguidos depois de tirar separadores, largura zero e
+ * dígitos por extenso (datas ISO/BR, safras e DFID não contam). Número de animal em texto livre
+ * sai: ele chega ao modelo pela chave própria (sisbov, identifier_value...), isenta por formato.
+ */
+export function codeLike(v: string): boolean {
+  const s = v.replace(ZERO_WIDTH, "");
+  if (ESCAPES.test(s)) return true;
+  if (LEFTOVER_PERCENT.test(decodeLayers(s))) return true;
+  if (s.split(/[^A-Za-z0-9+/=]+/).some(looksEncodedToken)) return true;
+  let digits = s.replace(DIGIT_WORD_RE, (w) => DIGIT_WORDS[w.toLowerCase()] ?? w);
+  for (const re of BENIGN_DIGITS) digits = digits.replace(re, " ");
+  return /\d{8,}/.test(digits.replace(/[\s.\-/_,:()+*#]+/g, ""));
+}
 
 /**
  * Isenção do scrub de texto, por FORMATO (review do #9, 4ª rodada): o nome da chave vem do
@@ -325,11 +385,11 @@ function scalarForModel(n: string, raw: string, idType: string | undefined): str
   const v = normalizeDigits(raw);
   if (idType !== undefined && ID_VALUE_KEYS.has(n)) {
     const fmt = FORMAT_BY_ID_TYPE[idType];
-    return fmt && fmt.test(v) ? v : scrubText(v);
+    return fmt && fmt.test(v) ? v : scrubText(v, n);
   }
   if (URL_KEYS.has(n)) return urlForModel(v);
   const fmt = FORMAT_BY_KEY[n];
-  return fmt && fmt.test(v) ? v : scrubText(v);
+  return fmt && fmt.test(v) ? v : scrubText(v, n);
 }
 
 export function forModel(value: unknown): unknown {
