@@ -158,6 +158,8 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   });
 
   const scrub = (v: string) => (forModel({ message: v }) as { message: string }).message;
+  /** Texto livre do PARCEIRO (sem a isenção de número de animal das mensagens da API). */
+  const partnerText = (v: string) => (forModel({ motivo: v }) as { motivo: string }).motivo;
 
   it("telefone BR em texto livre, com e sem DDD/+55, com e sem pontuação", () => {
     for (const phone of [
@@ -183,8 +185,8 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(scrub("cnpj 11222333000181")).toBe("cnpj [omitido]"); // DV válido
     // não é CPF/CNPJ (camada 1 não corta), mas 8+ dígitos em texto livre saem inteiros;
     // o número do animal chega ao modelo pela chave própria (sisbov), isenta por formato
-    expect(scrub("animal 07695743932951")).toBe("[omitido]");
-    expect(scrub("animal 105500497219998")).toBe("[omitido]");
+    expect(partnerText("animal 07695743932951")).toBe("[omitido]");
+    expect(partnerText("animal 105500497219998")).toBe("[omitido]");
     expect(forModel({ sisbov: "07695743932951" })).toEqual({ sisbov: "07695743932951" });
     // 11 dígitos sem DV válido: não é CPF, mas 8+ dígitos em texto livre é "cara de código" (6ª rodada)
     expect(scrub("numero 12345678900")).toBe("[omitido]");
@@ -339,8 +341,43 @@ describe("2. uma política de saída para todas as ferramentas", () => {
       datavacinacao: "2025-06-15",
     };
     expect(forModel(v)).toEqual(v);
-    expect(scrub("chip 982000123456789")).toBe("[omitido]");
-    expect(scrub("baixa do animal 105500497219998 por venda")).toBe("[omitido]");
+    expect(partnerText("chip 982000123456789")).toBe("[omitido]");
+    expect(partnerText("baixa do animal 105500497219998 por venda")).toBe("[omitido]");
+  });
+
+  // Mensagem da API cita o número do animal: ele é guardado, o resto passa pelo scrub.
+  const OLD_NOT_FOUND =
+    "Tag replacement: the replaced number (076957439329511) is not registered, so there is no animal to link the new number to. Send the animal's history under the replaced number first; nothing was ingested for this row.";
+
+  it("mensagem real de tag_replacement_old_not_found chega intacta", () => {
+    expect(forModel({ errors: [{ reason_code: "tag_replacement_old_not_found", message: OLD_NOT_FOUND }] })).toEqual({
+      errors: [{ reason_code: "tag_replacement_old_not_found", message: OLD_NOT_FOUND }],
+    });
+    expect(scrub("item DFID-BEEF-BR-2026-001415-2797eb e BR105500497219998")).toBe(
+      "item DFID-BEEF-BR-2026-001415-2797eb e BR105500497219998",
+    );
+    // 14 dígitos sem DV de CNPJ válido é guardado; com DV válido pode ser CNPJ citado e é cortado
+    expect(scrub("the replaced number (07695743932951) is not registered")).toBe("the replaced number (07695743932951) is not registered");
+    expect(scrub("the replaced number (11222333000181) is not registered")).toBe("the replaced number ([omitido]) is not registered");
+  });
+
+  it("mesma mensagem com CPF embutido: CPF cortado, número do animal mantido", () => {
+    const msg = OLD_NOT_FOUND.replace("first;", "first (producer CPF 529.982.247-25, tel (67) 99999-0000, joao@ex.com);");
+    const out = (forModel({ error_message: msg }) as { error_message: string }).error_message;
+    expect(out).toContain("076957439329511");
+    for (const leaked of ["529.982.247-25", "99999-0000", "joao@ex.com"]) expect(out).not.toContain(leaked);
+    expect(out).toContain("producer CPF [omitido], tel [omitido], [omitido]");
+  });
+
+  it("mensagem com código além do número do animal continua omitida, e o teto de 400 vale", () => {
+    expect(scrub("the replaced number (076957439329511) is not registered NTI5Ljk4Mi4yNDctMjU=")).toBe("[omitido]");
+    const long = `number (076957439329511) ${"x ".repeat(300)}`;
+    expect(scrub(long).endsWith("…[truncado]")).toBe(true);
+  });
+
+  it("texto livre do parceiro com o número do animal continua omitido", () => {
+    expect(partnerText(OLD_NOT_FOUND)).toBe("[omitido]");
+    expect(partnerText("baixa do animal 076957439329511")).toBe("[omitido]");
   });
 
   const LEGIT: Record<string, string> = {

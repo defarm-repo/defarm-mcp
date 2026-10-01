@@ -254,7 +254,37 @@ const MESSAGE_KEYS = new Set(["message", "errormessage"]);
 const MESSAGE_MAX = 400;
 const TRUNCATED = "…[truncado]";
 
+/**
+ * Mensagens geradas pela API (MESSAGE_KEYS) citam o número do animal ("the replaced number
+ * (076957439329511) is not registered…"), e essa explicação é o caso de uso principal. Nelas, e
+ * SÓ nelas, o token de número de animal (SISBOV 14/15, BR+15, chip ISO 15, DFID; 14 dígitos só se não
+ * for CNPJ com DV válido) é guardado antes
+ * do scrub e devolvido depois; o resto da mensagem passa pelo scrub normal. Texto livre do
+ * parceiro (motivo etc.) não tem essa isenção.
+ */
+const ANIMAL_TOKEN = /(?<!\d)(?:BR\d{15}|\d{14,15})(?!\d)|DFID-[A-Z]{1,7}-[A-Z]{2}-\d{4}-\d{6}-[0-9a-f]{6}/g;
+const SLOT = "\uE000";
+
 function scrubText(v: string, key?: string): string {
+  if (key !== undefined && MESSAGE_KEYS.has(key)) {
+    const kept: string[] = [];
+    const masked = normalizeDigits(v).replace(ANIMAL_TOKEN, (t) => {
+      // A mensagem pode citar identificador de rota (CNPJ cru tem 14 dígitos): 14 dígitos com DV
+      // de CNPJ válido não é guardado e cai no scrub. O SISBOV ainda vai em identifier_value.
+      if (/^\d{14}$/.test(t) && isValidCnpj(t)) return t;
+      kept.push(t);
+      return SLOT + String.fromCharCode(97 + ((kept.length - 1) % 26)) + SLOT;
+    });
+    if (kept.length > 0) {
+      const out = scrubFree(masked, MESSAGE_MAX);
+      let i = 0;
+      return out.replace(new RegExp(`${SLOT}[a-z]${SLOT}`, "g"), () => kept[i++] ?? "");
+    }
+  }
+  return scrubFree(v, key !== undefined && MESSAGE_KEYS.has(key) ? MESSAGE_MAX : FREE_TEXT_MAX);
+}
+
+function scrubFree(v: string, max: number): string {
   const plain = normalizeDigits(v);
   const scrubbed = scrubPlain(plain);
   const decoded = normalizeDigits(decodeLayers(plain));
@@ -264,7 +294,6 @@ function scrubText(v: string, key?: string): string {
     return OMIT;
   }
   if (codeLike(scrubbed) || codeLike(scrubPlain(decoded))) return OMIT;
-  const max = key !== undefined && MESSAGE_KEYS.has(key) ? MESSAGE_MAX : FREE_TEXT_MAX;
   return scrubbed.length > max ? scrubbed.slice(0, max) + TRUNCATED : scrubbed;
 }
 
