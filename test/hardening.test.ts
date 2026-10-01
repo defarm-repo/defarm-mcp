@@ -125,9 +125,9 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   });
 
   it("chave desconhecida é fechada por padrão (fail-closed)", () => {
-    expect(forModel({ campo_novo_do_parceiro: "qualquer coisa", sisbov: "105500497219998" })).toEqual({
+    expect(forModel({ campo_novo_do_parceiro: "qualquer coisa", sisbov: "100000000019998" })).toEqual({
       campo_novo_do_parceiro: "[omitido]",
-      sisbov: "105500497219998",
+      sisbov: "100000000019998",
     });
   });
 
@@ -142,13 +142,13 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   it("valor de identificador só passa se for do animal", () => {
     const out = forModel({
       identifiers: [
-        { identifier_type: "SISBOV", value: "105500497219998" },
+        { identifier_type: "SISBOV", value: "100000000019998" },
         { identifier_type: "CPF", value: "12345678900" },
         { identifier_type: "car", value: "MS-5003207-ABCD" },
       ],
       routes: [{ route_type: "cnpj", route_value: "12345678000199", circuit_id: "c1" }],
     }) as { identifiers: { value: string }[]; routes: { route_value: string; circuit_id: string }[] };
-    expect(out.identifiers.map((i) => i.value)).toEqual(["105500497219998", "[omitido]", "[omitido]"]);
+    expect(out.identifiers.map((i) => i.value)).toEqual(["100000000019998", "[omitido]", "[omitido]"]);
     expect(out.routes[0]).toEqual({ route_type: "cnpj", route_value: "[omitido]", circuit_id: "c1" });
   });
 
@@ -186,7 +186,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     // não é CPF/CNPJ (camada 1 não corta), mas 8+ dígitos em texto livre saem inteiros;
     // o número do animal chega ao modelo pela chave própria (sisbov), isenta por formato
     expect(partnerText("animal 07695743932951")).toBe("[omitido]");
-    expect(partnerText("animal 105500497219998")).toBe("[omitido]");
+    expect(partnerText("animal 100000000019998")).toBe("[omitido]");
     expect(forModel({ sisbov: "07695743932951" })).toEqual({ sisbov: "07695743932951" });
     // 11 dígitos sem DV válido: não é CPF, mas 8+ dígitos em texto livre é "cara de código" (6ª rodada)
     expect(scrub("numero 12345678900")).toBe("[omitido]");
@@ -296,7 +296,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(scrub("tel (٦٧) ٩٩٩٩٩-٠٠٠٠")).toBe("tel [omitido]"); // arábico-índicos
     expect(scrub("tel ۶۷۹۹۹۹۹۰۰۰۰")).toBe("tel [omitido]"); // persas
     expect(scrub("cpf 𝟓𝟐𝟗𝟗𝟖𝟐𝟐𝟒𝟕𝟐𝟓")).toBe("cpf [omitido]"); // dígitos matemáticos (blocos contíguos)
-    expect(forModel({ sisbov: "１０５５００４９７２１９９９８" })).toEqual({ sisbov: "105500497219998" });
+    expect(forModel({ sisbov: "１０００００００００１９９９８" })).toEqual({ sisbov: "100000000019998" });
     // formato checado na forma normalizada: SISBOV de 14 com DV de CNPJ válido, em largura total
     expect(forModel({ sisbov: "１１２２２３３３０００１８１" })).toEqual({ sisbov: "11222333000181" });
   });
@@ -334,7 +334,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
 
   it("identificador e data em chave própria passam; o mesmo número em texto livre sai", () => {
     const v = {
-      sisbov: "105500497219998",
+      sisbov: "100000000019998",
       chip: "982000123456789",
       dfid: "DFID-BEEF-BR-2026-001415-2797eb",
       transaction_hash: "070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76",
@@ -344,7 +344,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     };
     expect(forModel(v)).toEqual(v);
     expect(partnerText("chip 982000123456789")).toBe("[omitido]");
-    expect(partnerText("baixa do animal 105500497219998 por venda")).toBe("[omitido]");
+    expect(partnerText("baixa do animal 100000000019998 por venda")).toBe("[omitido]");
   });
 
   // 7ª rodada: preservação contextual. Número de animal só é mantido em texto quando já é
@@ -400,18 +400,18 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   });
 
   const animal = (motivo: string, extra: Record<string, unknown> = {}) => ({
-    item: { dfid: "DFID-BEEF-BR-2026-001415-2797eb", metadata: { numeroelementoidentificacao: "105500497219998" } },
-    identifiers: [{ identifier_type: "SISBOV", value: "105500497219998" }, ...((extra.ids as unknown[]) ?? [])],
+    item: { dfid: "DFID-BEEF-BR-2026-001415-2797eb", metadata: { numeroelementoidentificacao: "100000000019998" } },
+    identifiers: [{ identifier_type: "SISBOV", value: "100000000019998" }, ...((extra.ids as unknown[]) ?? [])],
     events: [{ event_type: "item_terminated", payload: { motivo } }],
   });
   const motivoOf = (out: unknown) => (out as { events: { payload: { motivo: string } }[] }).events[0]!.payload.motivo;
 
   it("motivo com o brinco do PRÓPRIO animal chega inteiro", () => {
-    expect(motivoOf(forModel(animal("morte natural, brinco 105500497219998")))).toBe("morte natural, brinco 105500497219998");
+    expect(motivoOf(forModel(animal("morte natural, brinco 100000000019998")))).toBe("morte natural, brinco 100000000019998");
   });
 
   it("motivo com o número de OUTRO animal sai omitido", () => {
-    expect(motivoOf(forModel(animal("morte natural, brinco 105500497210001")))).toBe("[omitido]");
+    expect(motivoOf(forModel(animal("morte natural, brinco 100000000010001")))).toBe("[omitido]");
   });
 
   it("identifier de tipo não-animal no item não libera o mesmo número no motivo", () => {
@@ -424,11 +424,11 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   it("número de um item não vale para outro item da lista", () => {
     const out = forModel({
       items: [
-        { dfid: "DFID-BEEF-BR-2026-000001-aaaaaa", metadata: { sisbov: "105500497219998", motivo: "brinco 105500497219998" } },
-        { dfid: "DFID-BEEF-BR-2026-000002-bbbbbb", metadata: { sisbov: "105500497210001", motivo: "brinco 105500497219998" } },
+        { dfid: "DFID-BEEF-BR-2026-000001-aaaaaa", metadata: { sisbov: "100000000019998", motivo: "brinco 100000000019998" } },
+        { dfid: "DFID-BEEF-BR-2026-000002-bbbbbb", metadata: { sisbov: "100000000010001", motivo: "brinco 100000000019998" } },
       ],
     }) as { items: { metadata: { motivo: string } }[] };
-    expect(out.items.map((i) => i.metadata.motivo)).toEqual(["brinco 105500497219998", "[omitido]"]);
+    expect(out.items.map((i) => i.metadata.motivo)).toEqual(["brinco 100000000019998", "[omitido]"]);
   });
 
   it("GTA 123456789 sai omitido, inclusive no motivo do próprio animal", () => {
@@ -453,7 +453,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   });
 
   it("(2) ambiguous_identifier real: identifier_value 'A,B' e a mensagem com os dois números passam", () => {
-    const B = "105500497219998";
+    const B = "100000000019998";
     const err = {
       row_index: 0,
       reason_code: "ambiguous_identifier",
@@ -511,7 +511,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   it("controle: valores no formato esperado passam crus", () => {
     const v = {
       sisbov: "11222333000181", // 14 dígitos com DV de CNPJ válido
-      numeroelementoidentificacao: "BR105500497219998",
+      numeroelementoidentificacao: "BR100000000019998",
       chip: "982000123456789",
       rfid: "982000123456789",
       dfid: "DFID-BEEF-BR-2026-001415-2797eb",
