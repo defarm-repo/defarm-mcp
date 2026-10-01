@@ -112,16 +112,47 @@ const ID_TYPE_KEYS = ["identifier_type", "identifierType", "route_type", "routeT
 const ID_VALUE_KEYS = new Set(["value", "identifiervalue", "routevalue"]);
 
 const OMIT = "[omitido]";
-// Padrões numéricos exigem fronteira alfanumérica: hash hex e DFID têm dígitos colados a letras.
-// CPF/CNPJ: cortados quando escritos com pontuação, ou sem pontuação com dígitos verificadores
-// válidos. Dígito solto sem DV válido passa (um SISBOV de 14/15 dígitos não é CPF/CNPJ).
-const CPF_RE = /(?<![0-9A-Za-z])\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?![0-9A-Za-z])/g;
-const CNPJ_RE = /(?<![0-9A-Za-z])\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}(?![0-9A-Za-z])/g;
+// Fronteira dos padrões numéricos: só DÍGITO dos lados (letra não protege: "cpf52998224725").
+// Hashes, ids e identificadores do animal não passam por aqui (ver NO_SCRUB_KEYS).
+// CPF/CNPJ: cortados quando escritos com pontuação (. - /), ou sem ela (inclusive separados por
+// espaço) com dígitos verificadores válidos. Dígito solto sem DV válido passa.
+const CPF_RE = /(?<!\d)\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}(?!\d)/g;
+const CNPJ_RE = /(?<!\d)\d{2}[.\s]?\d{3}[.\s]?\d{3}[/\s]?\d{4}[-\s]?\d{2}(?!\d)/g;
 const EMAIL_RE = /[^\s@"]+@[^\s@"]+\.[a-z]{2,}/gi;
-// Telefone BR: com separador no meio (99999-0000, (67) 3333 4444, +55 67 99999.0000)...
-const PHONE_PUNCT_RE = /(?<![0-9A-Za-z])(?:\+?55[\s.-]?)?(?:\(?[1-9]\d\)?[\s.-]?)?9?\d{4}[\s.-]\d{4}(?![0-9A-Za-z])/g;
-// ...ou só dígitos com DDD (celular DD9XXXXXXXX, fixo DD[2-5]XXXXXXX), com ou sem +55.
-const PHONE_PLAIN_RE = /(?<![0-9A-Za-z])(?:\+?55)?[1-9]\d(?:9\d{8}|[2-5]\d{7})(?![0-9A-Za-z])/g;
+// Telefone BR: [+55] [DDD] assinante, validado no callback (DDD real, formato do assinante). Não
+// começa logo após dígito+separador: em "06-15 20250615" o 15 é da data, não um DDD.
+const PHONE_RE = /(?<!\d[\s.-]?)(\+?55[\s.-]?)?(\(?\d{2}\)?[\s.-]?)?(9?\d{4})([\s.-]?)(\d{4})(?!\d)/g;
+
+/** Códigos nacionais (DDD) em uso, conforme o plano de numeração da Anatel (67 códigos). */
+export const BR_DDD: ReadonlySet<string> = new Set(
+  [
+    "11-19", "21", "22", "24", "27", "28", "31-35", "37", "38", "41-49", "51", "53-55",
+    "61-69", "71", "73-75", "77", "79", "81-89", "91-99",
+  ].flatMap((r) => {
+    const [lo, hi = lo] = r.split("-").map(Number) as [number, number?];
+    return Array.from({ length: (hi ?? lo) - lo + 1 }, (_, i) => String(lo + i));
+  }),
+);
+
+const YEAR = /^(19|20)\d{2}$/;
+
+function phoneOrKeep(m: string, country?: string, dddPart?: string, first?: string, sep?: string, last?: string): string {
+  const ddd = dddPart?.replace(/\D/g, "");
+  if (ddd !== undefined && !BR_DDD.has(ddd)) return m;
+  if (country && ddd === undefined) return m;
+  const sub = `${first}${last}`;
+  // Celular: 9 dígitos começando com 9. Fixo: 8 dígitos começando com 2-5.
+  const isMobile = sub.length === 9 && sub.startsWith("9");
+  const isLandline = sub.length === 8 && /^[2-5]/.test(sub);
+  if (!isMobile && !isLandline) return m;
+  // Sem DDD, só com separador (senão qualquer número de 8/9 dígitos viraria telefone),
+  // e intervalo de anos ("safra 2024-2025") não é telefone.
+  if (ddd === undefined) {
+    if (!sep) return m;
+    if (YEAR.test(first ?? "") && YEAR.test(last ?? "")) return m;
+  }
+  return OMIT;
+}
 
 function digitsOf(v: string): number[] {
   return v.replace(/\D/g, "").split("").map(Number);
@@ -151,7 +182,7 @@ export function isValidCnpj(v: string): boolean {
   return calc(12) === d[12] && calc(13) === d[13];
 }
 
-const hasPunct = (m: string) => /[^\d]/.test(m);
+const hasPunct = (m: string) => /[.\-/]/.test(m);
 
 function keyVerdict(k: string): "deny" | "allow" | "unknown" {
   const n = norm(k);
@@ -166,9 +197,18 @@ function scrubText(v: string): string {
     .replace(EMAIL_RE, OMIT)
     .replace(CNPJ_RE, (m) => (hasPunct(m) || isValidCnpj(m) ? OMIT : m))
     .replace(CPF_RE, (m) => (hasPunct(m) || isValidCpf(m) ? OMIT : m))
-    .replace(PHONE_PUNCT_RE, OMIT)
-    .replace(PHONE_PLAIN_RE, OMIT);
+    .replace(PHONE_RE, (m, c, d, f, sep, l) => phoneOrKeep(m, c, d, f, sep, l));
 }
+
+/**
+ * Valores que nunca passam pelo scrub de texto: identificador do animal (um SISBOV de 14 dígitos
+ * pode ter DV de CNPJ válido) e ids/hashes gerados pela DeFarm. São dado estruturado, não texto livre.
+ */
+const NO_SCRUB_KEYS: ReadonlySet<string> = new Set([
+  "sisbov", "numeroelementoidentificacao", "numeroelementoidentificacaosubstituido", "chip", "rfid",
+  "brinco", "dfid", "id", "itemid", "circuitid", "ingestionid", "transactionhash", "nfttxhash",
+  "contentid", "explorerurl", "gatewayurl", "publicpage", "verifypage",
+]);
 
 export function forModel(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(forModel);
@@ -184,7 +224,10 @@ export function forModel(value: unknown): unknown {
       out[k] = OMIT;
       continue;
     }
-    out[k] = !idTypeIsAnimal && ID_VALUE_KEYS.has(norm(k)) ? OMIT : forModel(v);
+    const n = norm(k);
+    if (ID_VALUE_KEYS.has(n) && !idTypeIsAnimal) out[k] = OMIT;
+    else if (typeof v === "string" && (NO_SCRUB_KEYS.has(n) || (ID_VALUE_KEYS.has(n) && typeKey))) out[k] = v;
+    else out[k] = forModel(v);
   }
   return out;
 }

@@ -186,10 +186,52 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(scrub("numero 12345678900")).toBe("numero 12345678900"); // 11 dígitos, DV de CPF inválido
   });
 
-  it("não corta hash, DFID, datas nem número de ledger", () => {
-    const keep =
-      "tx 070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76 DFID-BEEF-BR-2026-001415-2797eb 2025-06-15 20250615 64706496";
+  it("não corta DFID, datas nem número de ledger no texto; hash e id não passam pelo scrub", () => {
+    const keep = "DFID-BEEF-BR-2026-001415-2797eb 2025-06-15 20250615 ledger 64706496";
     expect(scrub(keep)).toBe(keep);
+    const hash = "070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76";
+    expect(forModel({ transaction_hash: hash, dfid: "DFID-BEEF-BR-2026-001415-2797eb" })).toEqual({
+      transaction_hash: hash,
+      dfid: "DFID-BEEF-BR-2026-001415-2797eb",
+    });
+  });
+
+  // 3ª rodada da review do #9: os casos do revisor, literais.
+  it("(a) CPF/CNPJ válidos separados por espaço saem", () => {
+    expect(scrub("529 982 247 25")).toBe("[omitido]");
+    expect(scrub("11 222 333 0001 81")).toBe("[omitido]");
+  });
+
+  it("(b) número colado em letra não escapa", () => {
+    expect(scrub("cpf52998224725")).toBe("cpf[omitido]");
+    expect(scrub("cel67999990000")).toBe("cel[omitido]");
+  });
+
+  it("(c) intervalo de anos não é telefone", () => {
+    expect(scrub("safra 2024-2025")).toBe("safra 2024-2025");
+    expect(scrub("em 2025-06-15 20250615")).toBe("em 2025-06-15 20250615"); // o 15 da data não vira DDD
+  });
+
+  it("(d) DDD inexistente ou assinante fora do formato não é telefone", () => {
+    expect(scrub("lote 1234 5678")).toBe("lote 1234 5678");
+    expect(scrub("protocolo 10987654321")).toBe("protocolo 10987654321");
+    expect(scrub("(20) 99999-0000")).toBe("(20) 99999-0000"); // DDD 20 não existe
+    expect(scrub("(67) 99999-0000")).toBe("[omitido]");
+  });
+
+  it("(e) SISBOV de 14 dígitos com DV de CNPJ válido nunca some do identificador do animal", () => {
+    const n = "11222333000181"; // DV de CNPJ válido
+    expect(
+      forModel({
+        identifiers: [{ identifier_type: "SISBOV", value: n }],
+        asset_reference: { identifier_type: "sisbov", value: n },
+        item: { metadata: { numeroelementoidentificacao: n, sisbov: n } },
+      }),
+    ).toEqual({
+      identifiers: [{ identifier_type: "SISBOV", value: n }],
+      asset_reference: { identifier_type: "sisbov", value: n },
+      item: { metadata: { numeroelementoidentificacao: n, sisbov: n } },
+    });
   });
 
   it("fato público com 'nome' na chave passa (allowlist antes da negação); o resto continua negado", () => {
