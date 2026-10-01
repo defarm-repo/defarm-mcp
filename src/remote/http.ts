@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { RemoteApi } from "./api.js";
-import { createRemoteMcpServer } from "./server.js";
+import { checkToolCall, createRemoteMcpServer } from "./server.js";
 
 export interface RemoteHttpOptions {
   apiBase: string;
@@ -21,6 +21,11 @@ export interface RemoteHttpOptions {
   perKeyPerMinute?: number | undefined;
   perIpPerMinute?: number | undefined;
   now?: (() => number) | undefined;
+  /**
+   * Header com o IP do cliente gravado pelo proxy de borda confiável (default `x-real-ip`, que a
+   * borda da Railway define). Valor vindo do cliente em outro header não é usado.
+   */
+  clientIpHeader?: string | undefined;
 }
 
 /** Limite por janela fixa de 1 min, em memória (uma instância). Protege a API e o servidor. */
@@ -49,10 +54,27 @@ export class RateLimiter {
   }
 }
 
-function clientIp(req: IncomingMessage): string {
+/**
+ * IP para o limite (achado 6). O primeiro valor de X-Forwarded-For é o que o CLIENTE mandou, então
+ * não serve. Vale o header que a borda confiável grava (Railway: X-Real-IP); sem ele, o salto mais
+ * à direita do X-Forwarded-For, que é o acrescentado pelo último proxy; sem nenhum, o socket.
+ */
+export function clientIp(req: IncomingMessage, trustedHeader = "x-real-ip"): string {
+  const trusted = req.headers[trustedHeader.toLowerCase()];
+  const t = (Array.isArray(trusted) ? trusted[trusted.length - 1] : trusted)?.trim();
+  if (t) return t;
   const xff = req.headers["x-forwarded-for"];
-  const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
-  return first || req.socket.remoteAddress || "unknown";
+  const hops = (Array.isArray(xff) ? xff.join(",") : xff ?? "").split(",").map((h) => h.trim()).filter(Boolean);
+  return hops[hops.length - 1] || req.socket.remoteAddress || "unknown";
+}
+
+function rateLimited(res: ServerResponse, retryAfter: number, scope: "ip" | "key"): void {
+  res.setHeader("retry-after", String(retryAfter));
+  json(res, 429, {
+    error: "rate_limited",
+    message: `Too many requests for this ${scope === "key" ? "API key" : "client"}. Retry after ${retryAfter} seconds.`,
+    retry_after_seconds: retryAfter,
+  });
 }
 
 export function extractApiKey(req: IncomingMessage): string | null {
@@ -95,11 +117,8 @@ export function createRemoteHttpHandler(opts: RemoteHttpOptions) {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname === "/healthz") return json(res, 200, { status: "ok" });
     if (url.pathname !== "/mcp") return json(res, 404, { error: "not_found" });
-    const ipWait = byIp.check(clientIp(req));
-    if (ipWait !== null) {
-      res.setHeader("retry-after", String(ipWait));
-      return json(res, 429, { error: "rate_limited", retry_after_seconds: ipWait });
-    }
+    const ipWait = byIp.check(clientIp(req, opts.clientIpHeader));
+    if (ipWait !== null) return rateLimited(res, ipWait, "ip");
     if (req.method !== "POST") {
       // Sem estado: sem stream GET nem DELETE de sessão.
       res.setHeader("allow", "POST");
@@ -114,16 +133,22 @@ export function createRemoteHttpHandler(opts: RemoteHttpOptions) {
     }
     // Pela chave (hash: a chave crua não fica nem na memória do limitador).
     const keyWait = byKey.check(createHash("sha256").update(apiKey).digest("hex"));
-    if (keyWait !== null) {
-      res.setHeader("retry-after", String(keyWait));
-      return json(res, 429, { error: "rate_limited", retry_after_seconds: keyWait });
-    }
+    if (keyWait !== null) return rateLimited(res, keyWait, "key");
     let body: unknown;
     try {
       body = await readJson(req);
     } catch (e) {
       if (e instanceof BodyTooLarge) return json(res, 413, { error: "payload_too_large", max_bytes: MAX_BODY_BYTES });
       return json(res, 400, { error: "invalid_json" });
+    }
+    // Achado 4: batch JSON-RPC saiu do protocolo em 2025-06-18, e um array contava como uma só
+    // requisição no limite por chave.
+    if (Array.isArray(body)) {
+      return json(res, 400, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "JSON-RPC batch requests are not supported. Send one request per HTTP POST." },
+      });
     }
     const api = new RemoteApi({ baseUrl: opts.apiBase, apiKey, fetchImpl: opts.fetchImpl, userAgent: "defarm-mcp-remote/0.2.0" });
     const server = createRemoteMcpServer(api, { docsBase: opts.docsBase, fetchImpl: opts.fetchImpl });
@@ -133,6 +158,12 @@ export function createRemoteHttpHandler(opts: RemoteHttpOptions) {
       void server.close();
     });
     // O tipo do transporte diverge de Transport só sob exactOptionalPropertyTypes (onclose?).
+    const header = req.headers["mcp-protocol-version"];
+    const rpcError = checkToolCall(server, body, Array.isArray(header) ? header[0] : header);
+    if (rpcError) {
+      void server.close();
+      return json(res, 200, rpcError);
+    }
     await server.connect(transport as unknown as Transport);
     await transport.handleRequest(req, res, body);
   };
@@ -146,6 +177,7 @@ if (isMain) {
     docsBase: process.env.DEFARM_DOCS_BASE ?? "https://docs.defarm.net",
     perKeyPerMinute: process.env.MCP_RATE_PER_KEY ? Number(process.env.MCP_RATE_PER_KEY) : undefined,
     perIpPerMinute: process.env.MCP_RATE_PER_IP ? Number(process.env.MCP_RATE_PER_IP) : undefined,
+    clientIpHeader: process.env.MCP_CLIENT_IP_HEADER || undefined,
   });
   createServer((req, res) => {
     handler(req, res).catch(() => {
