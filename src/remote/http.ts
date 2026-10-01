@@ -26,12 +26,6 @@ export interface RemoteHttpOptions {
    * borda da Railway define). Valor vindo do cliente em outro header não é usado.
    */
   clientIpHeader?: string | undefined;
-  /**
-   * Diagnóstico TEMPORÁRIO (env MCP_LOG_CLIENT_IP=1): loga, por requisição em /mcp, o header
-   * confiável recebido, o salto mais à direita do X-Forwarded-For e o IP usado no limite. Serve
-   * pra provar que a borda sobrescreve um X-Real-IP mandado pelo cliente. Desligar depois.
-   */
-  logClientIp?: boolean | undefined;
 }
 
 /** Limite por janela fixa de 1 min, em memória (uma instância). Protege a API e o servidor. */
@@ -124,21 +118,6 @@ export function createRemoteHttpHandler(opts: RemoteHttpOptions) {
     if (url.pathname === "/healthz") return json(res, 200, { status: "ok" });
     if (url.pathname !== "/mcp") return json(res, 404, { error: "not_found" });
     const ip = clientIp(req, opts.clientIpHeader);
-    if (opts.logClientIp) {
-      const header = (opts.clientIpHeader ?? "x-real-ip").toLowerCase();
-      const xff = req.headers["x-forwarded-for"];
-      const hops = (Array.isArray(xff) ? xff.join(",") : xff ?? "").split(",").map((h) => h.trim()).filter(Boolean);
-      console.error(
-        JSON.stringify({
-          diag: "client_ip",
-          trusted_header: header,
-          trusted_value: req.headers[header] ?? null,
-          xff_hops: hops.length,
-          xff_rightmost: hops[hops.length - 1] ?? null,
-          used: ip,
-        }),
-      );
-    }
     const ipWait = byIp.check(ip);
     if (ipWait !== null) return rateLimited(res, ipWait, "ip");
     if (req.method !== "POST") {
@@ -200,7 +179,6 @@ if (isMain) {
     perKeyPerMinute: process.env.MCP_RATE_PER_KEY ? Number(process.env.MCP_RATE_PER_KEY) : undefined,
     perIpPerMinute: process.env.MCP_RATE_PER_IP ? Number(process.env.MCP_RATE_PER_IP) : undefined,
     clientIpHeader: process.env.MCP_CLIENT_IP_HEADER || undefined,
-    logClientIp: process.env.MCP_LOG_CLIENT_IP === "1",
   });
   createServer((req, res) => {
     handler(req, res).catch(() => {

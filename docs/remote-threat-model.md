@@ -86,3 +86,13 @@ attempt to detect injection.
 Which items, events and ingestions a key can see is decided by the DeFarm API, not by the MCP. The
 MCP has no credential of its own: it forwards the partner's key on every call. A filter bug can
 leak a field of data the key could already read; it cannot widen what the key can read.
+
+## Per-IP rate limit
+
+The per-IP limit keys on `X-Real-IP`, which the Railway edge sets. Verified in production on
+2026-10-01 with a temporary diagnostic log: a request sent with `X-Real-IP: 203.0.113.77` was
+received with the client's real address in that header, so the edge overwrites a client-sent value.
+
+`X-Forwarded-For` is not a reliable fallback here: on the same request its right-most hop was a
+proxy address, not the client. If `X-Real-IP` were ever missing, every client would share one
+bucket. The per-key limit still applies per partner.
