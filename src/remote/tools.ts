@@ -192,13 +192,63 @@ function keyVerdict(k: string): "deny" | "allow" | "unknown" {
   return "unknown";
 }
 
-function scrubText(v: string): string {
+function scrubPlain(v: string): string {
   return v
     .replace(EMAIL_RE, OMIT)
     .replace(CNPJ_RE, (m) => (hasPunct(m) || isValidCnpj(m) ? OMIT : m))
     .replace(CPF_RE, (m) => (hasPunct(m) || isValidCpf(m) ? OMIT : m))
     .replace(PHONE_RE, (m, c, d, f, sep, l) => phoneOrKeep(m, c, d, f, sep, l));
 }
+
+/**
+ * Dígitos Unicode (largura total, arábico-índicos...) viram ASCII antes de qualquer checagem
+ * (review do #9, 5ª rodada): `\d` é ASCII. NFKC resolve as formas de compatibilidade (largura
+ * total); o resto de \p{Nd} é mapeado pelo valor: a Unicode codifica cada sistema de dígitos em
+ * blocos contíguos de 10, de 0 a 9, então o valor é a distância ao início do bloco, módulo 10.
+ */
+export function normalizeDigits(v: string): string {
+  return v.normalize("NFKC").replace(/\p{Nd}/gu, (ch) => {
+    const cp = ch.codePointAt(0)!;
+    if (cp >= 0x30 && cp <= 0x39) return ch;
+    let start = cp;
+    while (/\p{Nd}/u.test(String.fromCodePoint(start - 1))) start--;
+    return String((cp - start) % 10);
+  });
+}
+
+/** Decodifica percent-encoding (e `+` de formulário) até estabilizar; erro = mantém o que tem. */
+function decodeLayers(v: string): string {
+  let cur = v;
+  for (let i = 0; i < 3; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(cur.replace(/\+/g, " "));
+    } catch {
+      break;
+    }
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
+
+/**
+ * Scrub de texto livre. Roda sobre os dígitos normalizados; se a versão DECODIFICADA (percent-
+ * encoding) tiver PII que a codificada esconde (o 0 de %20 colado no número), o valor inteiro sai.
+ */
+function scrubText(v: string): string {
+  const plain = normalizeDigits(v);
+  const scrubbed = scrubPlain(plain);
+  const decoded = normalizeDigits(decodeLayers(plain));
+  // Decodificar só condena o valor se revelar MAIS PII do que o scrub direto achou (um "+55"
+  // legítimo vira espaço ao decodificar, mas não esconde nada).
+  if (decoded !== plain && omitCount(scrubPlain(decoded)) - omitCount(decoded) > omitCount(scrubbed) - omitCount(plain)) {
+    return OMIT;
+  }
+  return scrubbed;
+}
+
+const omitCount = (s: string) => s.split(OMIT).length - 1;
 
 /**
  * Isenção do scrub de texto, por FORMATO (review do #9, 4ª rodada): o nome da chave vem do
@@ -241,22 +291,38 @@ const FORMAT_BY_ID_TYPE: Record<string, RegExp> = {
 };
 
 const URL_KEYS = new Set(["explorerurl", "gatewayurl", "publicpage", "verifypage"]);
-const TRUSTED_HOSTS = new Set(["defarm.net", "www.defarm.net", "docs.defarm.net", "stellar.expert", "gateway.pinata.cloud", "ipfs.io"]);
 
-/** URL de host confiável, sem query/fragmento, e caminho que o scrub não altera; senão, scrub. */
-function urlForModel(v: string): string {
+/** Caminhos isentos por host: só os que a DeFarm gera. Qualquer outro passa pelo scrub. */
+const TRUSTED_PATHS: Record<string, RegExp[]> = {
+  "defarm.net": [new RegExp(`^/[iv]/${DFID_FMT.source.slice(1, -1)}$`)],
+  "www.defarm.net": [new RegExp(`^/[iv]/${DFID_FMT.source.slice(1, -1)}$`)],
+  "stellar.expert": [/^\/explorer\/public\/tx\/[0-9a-f]{64}$/i],
+  "gateway.pinata.cloud": [new RegExp(`^/ipfs/${CID_FMT.source.slice(1, -1)}$`)],
+  "ipfs.io": [new RegExp(`^/ipfs/${CID_FMT.source.slice(1, -1)}$`)],
+};
+
+/**
+ * URL só fica isenta com https, host confiável e caminho EXATAMENTE de um formato conhecido
+ * (/i/{DFID}, /v/{DFID}, tx/{hash64}, /ipfs/{CID}); a query e o fragmento saem. Fora disso, é
+ * texto e passa pelo scrub inteiro.
+ */
+function urlForModel(raw: string): string {
+  const v = normalizeDigits(raw);
   let u: URL;
   try {
     u = new URL(v);
   } catch {
-    return scrubText(v);
+    return scrubText(raw);
   }
-  if (u.protocol !== "https:" || !TRUSTED_HOSTS.has(u.hostname) || u.username || u.password) return scrubText(v);
-  const clean = `${u.origin}${u.pathname}`;
-  return scrubText(decodeURIComponent(u.pathname)) === decodeURIComponent(u.pathname) ? clean : scrubText(clean);
+  const paths = TRUSTED_PATHS[u.hostname];
+  if (u.protocol !== "https:" || !paths || u.username || u.password || !paths.some((re) => re.test(u.pathname))) {
+    return scrubText(raw);
+  }
+  return `${u.origin}${u.pathname}`;
 }
 
-function scalarForModel(n: string, v: string, idType: string | undefined): string {
+function scalarForModel(n: string, raw: string, idType: string | undefined): string {
+  const v = normalizeDigits(raw);
   if (idType !== undefined && ID_VALUE_KEYS.has(n)) {
     const fmt = FORMAT_BY_ID_TYPE[idType];
     return fmt && fmt.test(v) ? v : scrubText(v);

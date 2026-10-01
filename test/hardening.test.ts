@@ -250,9 +250,44 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   it("vetor 6: payload {identifier_type: SISBOV, value} com texto livre", () =>
     expect(leaksIn(forModel({ payload: { identifier_type: "SISBOV", value: T } }))).toEqual([]));
   it("vetor 7: query de payload.explorer_url", () => {
-    const out = forModel({ payload: { explorer_url: `https://stellar.expert/explorer/public/tx/abc?nota=${encodeURIComponent(T)}` } });
+    const tx = "070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76";
+    const out = forModel({ payload: { explorer_url: `https://stellar.expert/explorer/public/tx/${tx}?nota=${encodeURIComponent(T)}` } });
     expect(leaksIn(out)).toEqual([]);
-    expect(out).toEqual({ payload: { explorer_url: "https://stellar.expert/explorer/public/tx/abc" } });
+    expect(out).toEqual({ payload: { explorer_url: `https://stellar.expert/explorer/public/tx/${tx}` } });
+  });
+
+  // 5ª rodada: três rotas de fuga, uma por bloco.
+  it("(1) host DeFarm com path fora do formato conhecido passa pelo scrub", () => {
+    for (const url of [
+      "https://defarm.net/i/529.982.247-25",
+      "https://defarm.net/x/joao@ex.com",
+      "https://defarm.net/i/DFID-BEEF-BR-2026-001415-2797eb/67999990000",
+      `https://stellar.expert/explorer/public/account/${encodeURIComponent(T)}`,
+      "https://gateway.pinata.cloud/ipfs/QmPPpa5gmKf71nsXFBTRCdpnqypWSJVbxLeg4h2NVFAGio/cpf-52998224725",
+    ])
+      expect(JSON.stringify(forModel({ public_page: url }))).not.toMatch(/529\.?982\.?247-?25|67999990000|99999-0000|joao@ex\.com/);
+    expect(forModel({ public_page: "https://defarm.net/v/DFID-BEEF-BR-2026-001415-2797eb" })).toEqual({
+      public_page: "https://defarm.net/v/DFID-BEEF-BR-2026-001415-2797eb",
+    });
+  });
+
+  it("(2) texto percent-encoded não escapa (o 0 de %20 colado no número)", () => {
+    expect(scrub("tel%20(67)%2099999-0000")).toBe("[omitido]");
+    expect(scrub("cpf%2052998224725")).toBe("[omitido]");
+    expect(scrub("contato%3Djoao%40ex.com")).toBe("[omitido]");
+    expect(scrub("tel=67+99999+0000")).toBe("[omitido]");
+    expect(scrub("tel%2520(67)%252099999-0000")).toBe("[omitido]"); // duas camadas
+    expect(scrub("desconto 100%25 safra 2024-2025")).toBe("desconto 100%25 safra 2024-2025"); // sem PII
+  });
+
+  it("(3) dígitos Unicode viram ASCII antes do scrub e da checagem de formato", () => {
+    expect(scrub("cpf ５２９.９８２.２４７-２５")).toBe("cpf [omitido]"); // largura total
+    expect(scrub("tel (٦٧) ٩٩٩٩٩-٠٠٠٠")).toBe("tel [omitido]"); // arábico-índicos
+    expect(scrub("tel ۶۷۹۹۹۹۹۰۰۰۰")).toBe("tel [omitido]"); // persas
+    expect(scrub("cpf 𝟓𝟐𝟗𝟗𝟖𝟐𝟐𝟒𝟕𝟐𝟓")).toBe("cpf [omitido]"); // dígitos matemáticos (blocos contíguos)
+    expect(forModel({ sisbov: "１０５５００４９７２１９９９８" })).toEqual({ sisbov: "105500497219998" });
+    // formato checado na forma normalizada: SISBOV de 14 com DV de CNPJ válido, em largura total
+    expect(forModel({ sisbov: "１１２２２３３３０００１８１" })).toEqual({ sisbov: "11222333000181" });
   });
 
   it("controle: motivo com o mesmo texto é filtrado", () => expect(leaksIn(forModel({ motivo: T }))).toEqual([]));
