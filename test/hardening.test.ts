@@ -318,7 +318,9 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     "telefone por extenso": "ligue seis sete nove nove nove nove nove zero zero zero zero",
   };
   for (const [name, v] of Object.entries(OBFUSCATED)) {
-    it(`ofuscação sai omitida: ${name}`, () => expect(scrub(v)).toBe("[omitido]"));
+    // largura zero sai na entrada (8ª rodada), e o CPF que sobra é cortado pela camada 1
+    const expected = name === "dígitos com largura zero" ? "cpf [omitido]" : "[omitido]";
+    it(`ofuscação sai omitida: ${name}`, () => expect(scrub(v)).toBe(expected));
   }
 
   it("teto de tamanho em texto livre; mensagem da API tem teto maior", () => {
@@ -363,11 +365,12 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     const msg = OLD_NOT_FOUND.replace("first;", "first (producer CPF 529.982.247-25, tel (67) 99999-0000, joao@ex.com);");
     const out = msgOf(forModel(rowError(msg)));
     expect(out).toContain(OLD);
-    expect(out).toContain("producer CPF [omitido], tel [omitido], [omitido]");
+    expect(out).toContain("producer CPF [omitido], tel ([omitido], [omitido])");
+    for (const leaked of ["529", "99999", "joao@"]) expect(out).not.toContain(leaked);
   });
 
-  it("erro cuja mensagem cita número que NÃO é o da linha sai omitido", () => {
-    expect(msgOf(forModel(rowError(OLD_NOT_FOUND.replace(OLD, CNS))))).toBe("[omitido]");
+  it("erro cuja mensagem cita número que NÃO é o da linha: só o token sai, o template fica (8ª rodada)", () => {
+    expect(msgOf(forModel(rowError(OLD_NOT_FOUND.replace(OLD, CNS))))).toBe(OLD_NOT_FOUND.replace(OLD, "[omitido]"));
   });
 
   it("identifier_value de tipo não-animal não libera o número na mensagem", () => {
@@ -375,11 +378,13 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(msgOf(forModel(rowError("routing value 11222333000181 has no rule", "cnpj", "11222333000181")))).toBe(
       "routing value [omitido] has no rule",
     );
-    expect(msgOf(forModel(rowError("routing value 12345678000100 has no rule", "cnpj", "12345678000100")))).toBe("[omitido]");
+    expect(msgOf(forModel(rowError("routing value 12345678000100 has no rule", "cnpj", "12345678000100")))).toBe(
+      "routing value [omitido] has no rule",
+    );
   });
 
-  it("mensagem da API: código além do número continua omitida; teto de 400", () => {
-    expect(msgOf(forModel(rowError(`number (${OLD}) NTI5Ljk4Mi4yNDctMjU=`)))).toBe("[omitido]");
+  it("mensagem da API: código além do número é mascarado por token; teto de 400", () => {
+    expect(msgOf(forModel(rowError(`number (${OLD}) NTI5Ljk4Mi4yNDctMjU=`)))).toBe(`number (${OLD}) [omitido]`);
     const long = msgOf(forModel(rowError(`number (${OLD}) ${"x ".repeat(300)}`)));
     expect(long.endsWith("…[truncado]")).toBe(true);
     expect(long.length).toBe(400 + "…[truncado]".length);
@@ -429,6 +434,58 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   it("GTA 123456789 sai omitido, inclusive no motivo do próprio animal", () => {
     expect(partnerText("GTA 123456789")).toBe("[omitido]");
     expect(motivoOf(forModel(animal("transferência GTA 123456789")))).toBe("[omitido]");
+  });
+
+  // 8ª rodada: os cinco casos literais do revisor (A = número conhecido do item).
+  const A = "076000000000001";
+  const itemA = (motivo: string) => ({
+    item: { dfid: "DFID-BEEF-BR-2026-001415-2797eb", metadata: { sisbov: A } },
+    identifiers: [{ identifier_type: "SISBOV", value: A }],
+    events: [{ event_type: "item_terminated", payload: { motivo } }],
+  });
+
+  it("(1) PII partida em volta do número conhecido não passa", () => {
+    expect(motivoOf(forModel(itemA(`52998 ${A} 224725`)))).toBe("[omitido]");
+    expect(motivoOf(forModel(itemA(`67999 ${A} 887766`)))).toBe("[omitido]");
+    expect(motivoOf(forModel(itemA(`AFTOSA lote 2025/01 brinco ${A} dose 2ml`)))).toBe(`AFTOSA lote 2025/01 brinco ${A} dose 2ml`);
+    // na mensagem da API, os dois lados são mascarados e o número conhecido fica
+    expect(msgOf(forModel(rowError(`conflict 52998 ${A} 224725`, "SISBOV", A)))).toBe(`conflict [omitido] ${A} [omitido]`);
+  });
+
+  it("(2) ambiguous_identifier real: identifier_value 'A,B' e a mensagem com os dois números passam", () => {
+    const B = "105500497219998";
+    const err = {
+      row_index: 0,
+      reason_code: "ambiguous_identifier",
+      identifier_type: "sisbov",
+      identifier_value: `${A},${B}`,
+      message: `This row has two different animal numbers (${A}, ${B}). Send one number per row, or declare the tag replacement with substituto=1.`,
+    };
+    expect(forModel({ errors: [err] })).toEqual({ errors: [err] });
+    // uma parte fora do formato: nada libera, e identifier_value não passa
+    const bad = forModel({ errors: [{ ...err, identifier_value: `${A},529.982.247-25` }] }) as { errors: { identifier_value: string }[] };
+    expect(bad.errors[0]!.identifier_value).not.toContain("529");
+  });
+
+  it("(3) mensagem da API com número desconhecido: só o token sai", () => {
+    const CNS2 = "898001160651234";
+    expect(msgOf(forModel(rowError(`conflict ${A} vs ${CNS2}`, "SISBOV", A)))).toBe(`conflict ${A} vs [omitido]`);
+    // fora dos caminhos da API, a regra de omitir inteiro continua
+    expect(motivoOf(forModel(itemA(`conflict ${A} vs ${CNS2}`)))).toBe("[omitido]");
+  });
+
+  it("(4) caractere de uso privado injetado não adultera o fato", () => {
+    const pua = String.fromCharCode(0xe000);
+    expect(motivoOf(forModel(itemA(`x ${pua}a${pua} y`)))).toBe("x a y");
+    expect(motivoOf(forModel(itemA(`${pua}a${pua} brinco ${A}`)))).toBe(`a brinco ${A}`);
+    expect(motivoOf(forModel(itemA(`morte ${String.fromCodePoint(0xf0001)}natural`)))).toBe("morte natural");
+  });
+
+  it("(5) o teto nunca corta o número preservado no meio", () => {
+    const out = motivoOf(forModel(itemA(`${"m".repeat(110)} brinco ${A}`)));
+    expect(out.endsWith("…[truncado]")).toBe(true);
+    expect(out).not.toMatch(/07…|\d…/);
+    expect(out.includes(A) || !/\d/.test(out)).toBe(true);
   });
 
   it("DFID em mensagem da API é preservado pelo formato", () => {

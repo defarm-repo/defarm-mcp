@@ -274,23 +274,135 @@ const TRUNCATED = "…[truncado]";
  */
 type Known = ReadonlySet<string>;
 const DFID_TOKEN = /DFID-[A-Z]{1,7}-[A-Z]{2}-\d{4}-\d{6}-[0-9a-f]{6}/g;
-const DIGIT_RUN = /(?<![\dA-Za-z])(?:BR)?\d{8,}(?!\d)/g;
-const SLOT = "\uE000";
 
-function scrubWithKnown(v: string, max: number, known: Known): string {
-  const kept: string[] = [];
-  const keep = (t: string) => {
-    kept.push(t);
-    return SLOT + String.fromCharCode(97 + ((kept.length - 1) % 26)) + SLOT;
+/**
+ * Uso privado (BMP e planos 15/16) e largura zero saem da entrada antes de tudo (8ª rodada): não
+ * têm uso legítimo num fato agropecuário e serviam para injetar marcador ou partir sequências.
+ */
+const PRIVATE_USE = /[\uE000-\uF8FF\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]/gu;
+function cleanInput(v: string): string {
+  return normalizeDigits(v.replace(PRIVATE_USE, "").replace(ZERO_WIDTH, ""));
+}
+
+/** Pedaço de texto: `kept` = número de animal conhecido ou DFID, que vai intacto. */
+interface Piece {
+  text: string;
+  kept: boolean;
+}
+
+/**
+ * Separa os números preservados SEM marcador dentro do texto (não há sentinela para injetar).
+ * A detecção roda sobre os pedaços livres COLADOS (`glued`): o número conhecido some e não parte a
+ * contagem de dígitos ao redor ("52998 <A> 224725" volta a ser 11 dígitos).
+ */
+function splitKnown(v: string, known: Known): Piece[] {
+  const re = new RegExp(`${DFID_TOKEN.source}|(?<![\\dA-Za-z])(?:BR)?\\d{8,}(?!\\d)`, "g");
+  const pieces: Piece[] = [];
+  let last = 0;
+  for (const m of v.matchAll(re)) {
+    const t = m[0];
+    const keep = t.startsWith("DFID-") || known.has(t);
+    if (!keep) continue;
+    if (m.index! > last) pieces.push({ text: v.slice(last, m.index), kept: false });
+    pieces.push({ text: t, kept: true });
+    last = m.index! + t.length;
+  }
+  if (last < v.length) pieces.push({ text: v.slice(last), kept: false });
+  return pieces;
+}
+
+/** Teto em fronteira de pedaço: nunca corta dentro de um número preservado ou DFID. */
+function capPieces(parts: Piece[], max: number): string {
+  let out = "";
+  for (const p of parts) {
+    if (out.length + p.text.length <= max) {
+      out += p.text;
+      continue;
+    }
+    if (!p.kept) out += p.text.slice(0, max - out.length);
+    return out.trimEnd() + TRUNCATED;
+  }
+  return out;
+}
+
+/** Campo de fato público: o número do próprio animal fica; qualquer código no resto omite tudo. */
+function factText(v: string, max: number, known: Known): string {
+  const pieces = splitKnown(cleanInput(v), known);
+  if (!pieces.some((p) => p.kept)) return scrubFree(v, max);
+  const glued = pieces.filter((p) => !p.kept).map((p) => p.text).join("");
+  if (scrubFree(glued, Number.MAX_SAFE_INTEGER) === OMIT) return OMIT;
+  return capPieces(pieces.map((p) => (p.kept ? p : { text: scrubPlain(p.text), kept: false })), max);
+}
+
+const CLUSTER_SEP = /[\s.\-/_,:()+*#]/;
+/**
+ * Mensagem da API (template da DeFarm): mascara por TOKEN e mantém o template (8ª rodada). Sobre o
+ * texto livre colado, marca: grupo de 8+ dígitos (com separadores; datas/safras não contam), e-mail,
+ * escape/entidade, token base64/hex, token com %-encoding e 8+ dígitos por extenso. Cada trecho
+ * marcado vira [omitido] no pedaço de onde veio; o número conhecido fica entre eles.
+ */
+function apiMessageText(v: string, max: number, known: Known): string {
+  const pieces = splitKnown(cleanInput(v), known);
+  const free = pieces.map((p, i) => ({ ...p, i })).filter((p) => !p.kept);
+  const glued = free.map((p) => p.text).join("");
+  const origin: [number, number][] = [];
+  for (const p of free) for (let o = 0; o < p.text.length; o++) origin.push([p.i, o]);
+  const mark = new Array<boolean>(glued.length).fill(false);
+  const markRange = (from: number, to: number) => {
+    for (let x = from; x < to; x++) mark[x] = true;
   };
-  const masked = normalizeDigits(v)
-    .replace(DFID_TOKEN, keep)
-    .replace(DIGIT_RUN, (t) => (known.has(t) ? keep(t) : t));
-  const out = scrubFree(masked, Number.MAX_SAFE_INTEGER);
-  let i = 0;
-  const restored = out.replace(new RegExp(`${SLOT}[a-z]${SLOT}`, "g"), () => kept[i++] ?? "");
-  // teto depois de devolver os números: o limite vale para o texto que o modelo recebe
-  return restored.length > max ? restored.slice(0, max) + TRUNCATED : restored;
+  // datas e safras quebram o agrupamento de dígitos
+  const benign = new Array<boolean>(glued.length).fill(false);
+  for (const re of BENIGN_DIGITS) for (const m of glued.matchAll(new RegExp(re.source, "g"))) for (let x = m.index!; x < m.index! + m[0].length; x++) benign[x] = true;
+  const isDigit = (x: number) => !benign[x] && /\d/.test(glued[x]!);
+  for (let x = 0; x < glued.length; ) {
+    if (!isDigit(x)) {
+      x++;
+      continue;
+    }
+    let end = x;
+    let digits = 0;
+    let y = x;
+    while (y < glued.length && (isDigit(y) || (CLUSTER_SEP.test(glued[y]!) && !benign[y]))) {
+      if (isDigit(y)) {
+        digits++;
+        end = y + 1;
+      }
+      y++;
+    }
+    if (digits >= 8) markRange(x, end);
+    x = Math.max(end, x + 1);
+  }
+  const digitWordRun = new RegExp(
+    `(?:(?<![\\p{L}])(?:${Object.keys(DIGIT_WORDS).join("|")})(?![\\p{L}])[\\s,.-]*){8,}`,
+    "giu",
+  );
+  for (const re of [EMAIL_RE, new RegExp(ESCAPES.source, "gi"), digitWordRun]) for (const m of glued.matchAll(new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"))) markRange(m.index!, m.index! + m[0].length);
+  for (const m of glued.matchAll(/[^\s]+/g)) {
+    const tok = m[0];
+    if (LEFTOVER_PERCENT.test(tok) || tok.split(/[^A-Za-z0-9+/=]+/).some(looksEncodedToken)) markRange(m.index!, m.index! + tok.length);
+  }
+  // remonta cada pedaço livre trocando cada trecho marcado contíguo por [omitido]
+  // espaço na borda de um trecho marcado fica (não cola o [omitido] no número conhecido)
+  for (let x = 0; x < glued.length; x++) if (mark[x] && /\s/.test(glued[x]!)) {
+    const [pi] = origin[x]!;
+    const leftIn = x > 0 && origin[x - 1]![0] === pi && mark[x - 1] && !/\s/.test(glued[x - 1]!);
+    const rightIn = x + 1 < glued.length && origin[x + 1]![0] === pi && mark[x + 1];
+    if (!(leftIn && rightIn)) mark[x] = false;
+  }
+  const rebuilt = pieces.map((p) => ({ ...p }));
+  const buf = new Map<number, string>();
+  let prev: [number, boolean] | null = null;
+  glued.split("").forEach((ch, x) => {
+    const [pi] = origin[x]!;
+    const cur = buf.get(pi) ?? "";
+    if (mark[x]) {
+      if (!(prev && prev[0] === pi && prev[1])) buf.set(pi, cur + OMIT);
+    } else buf.set(pi, cur + ch);
+    prev = [pi, mark[x]!];
+  });
+  for (const p of free) rebuilt[p.i] = { text: buf.get(p.i) ?? "", kept: false };
+  return capPieces(rebuilt, max);
 }
 
 interface TextCtx {
@@ -302,13 +414,13 @@ interface TextCtx {
 
 /** Texto livre: mensagem da API (pelo caminho) e fato público preservam o animal conhecido. */
 function scrubText(v: string, ctx?: TextCtx): string {
-  if (ctx && API_MESSAGE_PATHS.includes(ctx.path)) return scrubWithKnown(v, MESSAGE_MAX, ctx.known);
-  if (ctx && (FACT_TEXT_KEYS.has(ctx.key) || PUBLIC_FACT_KEYS.has(ctx.key))) return scrubWithKnown(v, FREE_TEXT_MAX, ctx.known);
+  if (ctx && API_MESSAGE_PATHS.includes(ctx.path)) return apiMessageText(v, MESSAGE_MAX, ctx.known);
+  if (ctx && (FACT_TEXT_KEYS.has(ctx.key) || PUBLIC_FACT_KEYS.has(ctx.key))) return factText(v, FREE_TEXT_MAX, ctx.known);
   return scrubFree(v, FREE_TEXT_MAX);
 }
 
 function scrubFree(v: string, max: number): string {
-  const plain = normalizeDigits(v);
+  const plain = cleanInput(v);
   const scrubbed = scrubPlain(plain);
   const decoded = normalizeDigits(decodeLayers(plain));
   // Decodificar só condena o valor se revelar MAIS PII do que o scrub direto achou (um "+55"
@@ -437,8 +549,10 @@ function scalarForModel(ctx: TextCtx, raw: string, idType: string | undefined): 
   const n = ctx.key;
   const v = normalizeDigits(raw);
   if (idType !== undefined && ID_VALUE_KEYS.has(n)) {
+    // ambiguous_identifier grava "A,B": passa se TODAS as partes estiverem no formato do tipo
     const fmt = FORMAT_BY_ID_TYPE[idType];
-    return fmt && fmt.test(v) ? v : scrubText(v, ctx);
+    const parts = idParts(v);
+    return fmt && parts.length > 0 && parts.every((x) => fmt.test(x)) ? v : scrubText(v, ctx);
   }
   if (URL_KEYS.has(n)) return urlForModel(v);
   const fmt = FORMAT_BY_KEY[n];
@@ -454,13 +568,19 @@ const ANIMAL_VALUE_KEYS: Record<string, RegExp> = {
   rfid: CHIP_FMT,
 };
 
-function animalValue(type: unknown, value: unknown): string | null {
-  if (typeof type !== "string" || typeof value !== "string") return null;
+/** Partes de um identifier_value composto ("A,B" do ambiguous_identifier). */
+function idParts(v: string): string[] {
+  return v.split(/[,\s]+/).filter(Boolean);
+}
+
+/** Valores de animal válidos declarados por (tipo, valor); valor composto vira várias partes. */
+function animalValues(type: unknown, value: unknown): string[] {
+  if (typeof type !== "string" || typeof value !== "string") return [];
   const t = norm(type);
-  if (!ANIMAL_ID_TYPES.has(t)) return null;
-  const v = normalizeDigits(value);
+  if (!ANIMAL_ID_TYPES.has(t)) return [];
   const fmt = FORMAT_BY_ID_TYPE[t] ?? ANIMAL_VALUE_KEYS[t];
-  return fmt && fmt.test(v) ? v : null;
+  if (!fmt) return [];
+  return idParts(normalizeDigits(value)).filter((x) => fmt.test(x));
 }
 
 /**
@@ -470,18 +590,18 @@ function animalValue(type: unknown, value: unknown): string | null {
  */
 function ownAnimalIds(obj: Record<string, unknown>): string[] {
   const found: string[] = [];
-  const add = (v: string | null) => v && found.push(v);
+  const add = (vs: string[]) => found.push(...vs);
   const idsOf = (list: unknown) => {
     if (Array.isArray(list))
       for (const x of list) if (x && typeof x === "object") {
         const o = x as Record<string, unknown>;
-        add(animalValue(o.identifier_type ?? o.identifierType, o.value ?? o.identifier_value));
+        add(animalValues(o.identifier_type ?? o.identifierType, o.value ?? o.identifier_value));
       }
   };
   idsOf(obj.identifiers);
   const canon = obj.canonical_identifier as Record<string, unknown> | undefined;
-  if (canon && typeof canon === "object") add(animalValue(canon.identifier_type, canon.value));
-  add(animalValue(obj.identifier_type, obj.identifier_value));
+  if (canon && typeof canon === "object") add(animalValues(canon.identifier_type, canon.value));
+  add(animalValues(obj.identifier_type, obj.identifier_value));
   for (const holder of [obj.metadata, (obj.item as Record<string, unknown> | undefined)?.metadata]) {
     if (!holder || typeof holder !== "object") continue;
     for (const [k, v] of Object.entries(holder as Record<string, unknown>)) {

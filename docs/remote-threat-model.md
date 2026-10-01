@@ -39,6 +39,21 @@ human formatting. The policy keeps that from reaching the LLM provider by defaul
    a payload or partner metadata, is ordinary free text. A generic 14- or 15-digit pattern is not
    used: it also matches other national numbers, such as the 15-digit health card (CNS).
 
+   How preservation works:
+   - **Detection ignores the preserved number.** Detection runs on the remaining text with the
+     known number removed, so digits on both sides of it still add up. In
+     `52998 <known> 224725`, the 11 digits of a CPF are still caught.
+   - **Composite identifier values.** A value such as `A,B` (written by `ambiguous_identifier`) is
+     split. Each part is checked and preserved on its own, and the structured `identifier_value`
+     passes only when every part matches the format.
+   - **API messages are masked token by token.** They are DeFarm templates, so only the offending
+     token becomes `[omitido]` and the explanation stays. Partner free text and fact fields are
+     still omitted whole.
+   - **No in-band marker.** Text is split into kept and free pieces, so nothing in the input can
+     imitate a marker. Private-use characters (BMP and planes 15/16) and zero-width characters
+     are also stripped from all input first.
+   - **The length cap never splits a kept number or a DFID.** It cuts before them.
+
    **GTA (decision of 2026-10-01).** The GTA number is not sent to the LLM provider. A movement
    event keeps its type and date. A GTA number in free text falls under the 8+ digit rule.
 
