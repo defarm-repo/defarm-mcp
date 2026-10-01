@@ -249,39 +249,62 @@ function decodeLayers(v: string): string {
  * Ver o modelo de ameaça em docs/remote-threat-model.md.
  */
 const FREE_TEXT_MAX = 120;
-/** Mensagens da API da DeFarm (erro por linha, reason) são mais longas e geradas por nós. */
-const MESSAGE_KEYS = new Set(["message", "errormessage"]);
+/**
+ * Mensagens geradas pela API, ancoradas no CAMINHO a partir da raiz da resposta (chaves
+ * normalizadas, índices de array ignorados). Um `message` em qualquer outro lugar (payload,
+ * metadata do parceiro) é texto livre comum.
+ */
+const API_MESSAGE_PATHS = ["errors/message", "errormessage", "resultsummary/errors/message", "rows/errormessage"];
+/** Campos de fato público onde o número do próprio animal pode aparecer ("morte natural, brinco X"). */
+const FACT_TEXT_KEYS: ReadonlySet<string> = new Set([
+  "motivo", "motivobaixa", "reason", "vacina", "vacinaaplicada", "vaccine", "medicamento",
+  "medicamentoaplicado", "medication", "tratamento", "treatment", "principioativo",
+]);
 const MESSAGE_MAX = 400;
 const TRUNCATED = "…[truncado]";
 
 /**
- * Mensagens geradas pela API (MESSAGE_KEYS) citam o número do animal ("the replaced number
- * (076957439329511) is not registered…"), e essa explicação é o caso de uso principal. Nelas, e
- * SÓ nelas, o token de número de animal (SISBOV 14/15, BR+15, chip ISO 15, DFID; 14 dígitos só se não
- * for CNPJ com DV válido) é guardado antes
- * do scrub e devolvido depois; o resto da mensagem passa pelo scrub normal. Texto livre do
- * parceiro (motivo etc.) não tem essa isenção.
+ * Preservação CONTEXTUAL de número de animal (review do #9, 7ª rodada). Em texto livre, 8+ dígitos
+ * saem inteiros; a exceção é um número que JÁ é identificador de animal conhecido no próprio
+ * contexto da resposta (`Known`): o identifier_value de tipo animal do mesmo erro por linha, os
+ * identifiers[] de tipo animal e os identificadores canônicos do próprio item. Um número
+ * qualquer de 14/15 dígitos (um CNS, por exemplo) não é preservado. DFID é preservado pelo formato.
+ * Vale só em mensagem da API ancorada no caminho (API_MESSAGE_PATHS) e em campo de fato público
+ * (FACT_TEXT_KEYS); em qualquer outro lugar o texto livre fica com a regra estrita.
  */
-const ANIMAL_TOKEN = /(?<!\d)(?:BR\d{15}|\d{14,15})(?!\d)|DFID-[A-Z]{1,7}-[A-Z]{2}-\d{4}-\d{6}-[0-9a-f]{6}/g;
+type Known = ReadonlySet<string>;
+const DFID_TOKEN = /DFID-[A-Z]{1,7}-[A-Z]{2}-\d{4}-\d{6}-[0-9a-f]{6}/g;
+const DIGIT_RUN = /(?<![\dA-Za-z])(?:BR)?\d{8,}(?!\d)/g;
 const SLOT = "\uE000";
 
-function scrubText(v: string, key?: string): string {
-  if (key !== undefined && MESSAGE_KEYS.has(key)) {
-    const kept: string[] = [];
-    const masked = normalizeDigits(v).replace(ANIMAL_TOKEN, (t) => {
-      // A mensagem pode citar identificador de rota (CNPJ cru tem 14 dígitos): 14 dígitos com DV
-      // de CNPJ válido não é guardado e cai no scrub. O SISBOV ainda vai em identifier_value.
-      if (/^\d{14}$/.test(t) && isValidCnpj(t)) return t;
-      kept.push(t);
-      return SLOT + String.fromCharCode(97 + ((kept.length - 1) % 26)) + SLOT;
-    });
-    if (kept.length > 0) {
-      const out = scrubFree(masked, MESSAGE_MAX);
-      let i = 0;
-      return out.replace(new RegExp(`${SLOT}[a-z]${SLOT}`, "g"), () => kept[i++] ?? "");
-    }
-  }
-  return scrubFree(v, key !== undefined && MESSAGE_KEYS.has(key) ? MESSAGE_MAX : FREE_TEXT_MAX);
+function scrubWithKnown(v: string, max: number, known: Known): string {
+  const kept: string[] = [];
+  const keep = (t: string) => {
+    kept.push(t);
+    return SLOT + String.fromCharCode(97 + ((kept.length - 1) % 26)) + SLOT;
+  };
+  const masked = normalizeDigits(v)
+    .replace(DFID_TOKEN, keep)
+    .replace(DIGIT_RUN, (t) => (known.has(t) ? keep(t) : t));
+  const out = scrubFree(masked, Number.MAX_SAFE_INTEGER);
+  let i = 0;
+  const restored = out.replace(new RegExp(`${SLOT}[a-z]${SLOT}`, "g"), () => kept[i++] ?? "");
+  // teto depois de devolver os números: o limite vale para o texto que o modelo recebe
+  return restored.length > max ? restored.slice(0, max) + TRUNCATED : restored;
+}
+
+interface TextCtx {
+  /** Caminho de chaves normalizadas a partir da raiz da resposta, sem índices. */
+  path: string;
+  key: string;
+  known: Known;
+}
+
+/** Texto livre: mensagem da API (pelo caminho) e fato público preservam o animal conhecido. */
+function scrubText(v: string, ctx?: TextCtx): string {
+  if (ctx && API_MESSAGE_PATHS.includes(ctx.path)) return scrubWithKnown(v, MESSAGE_MAX, ctx.known);
+  if (ctx && (FACT_TEXT_KEYS.has(ctx.key) || PUBLIC_FACT_KEYS.has(ctx.key))) return scrubWithKnown(v, FREE_TEXT_MAX, ctx.known);
+  return scrubFree(v, FREE_TEXT_MAX);
 }
 
 function scrubFree(v: string, max: number): string {
@@ -410,22 +433,76 @@ function urlForModel(raw: string): string {
   return `${u.origin}${u.pathname}`;
 }
 
-function scalarForModel(n: string, raw: string, idType: string | undefined): string {
+function scalarForModel(ctx: TextCtx, raw: string, idType: string | undefined): string {
+  const n = ctx.key;
   const v = normalizeDigits(raw);
   if (idType !== undefined && ID_VALUE_KEYS.has(n)) {
     const fmt = FORMAT_BY_ID_TYPE[idType];
-    return fmt && fmt.test(v) ? v : scrubText(v, n);
+    return fmt && fmt.test(v) ? v : scrubText(v, ctx);
   }
   if (URL_KEYS.has(n)) return urlForModel(v);
   const fmt = FORMAT_BY_KEY[n];
-  return fmt && fmt.test(v) ? v : scrubText(v, n);
+  return fmt && fmt.test(v) ? v : scrubText(v, ctx);
+}
+
+/** Chaves de metadata/item que carregam o identificador canônico do próprio animal. */
+const ANIMAL_VALUE_KEYS: Record<string, RegExp> = {
+  sisbov: SISBOV_FMT,
+  numeroelementoidentificacao: SISBOV_FMT,
+  numeroelementoidentificacaosubstituido: SISBOV_FMT,
+  chip: CHIP_FMT,
+  rfid: CHIP_FMT,
+};
+
+function animalValue(type: unknown, value: unknown): string | null {
+  if (typeof type !== "string" || typeof value !== "string") return null;
+  const t = norm(type);
+  if (!ANIMAL_ID_TYPES.has(t)) return null;
+  const v = normalizeDigits(value);
+  const fmt = FORMAT_BY_ID_TYPE[t] ?? ANIMAL_VALUE_KEYS[t];
+  return fmt && fmt.test(v) ? v : null;
+}
+
+/**
+ * Identificadores de animal que ESTE objeto declara sobre si mesmo: identifiers[] e
+ * canonical_identifier de tipo animal, os campos canônicos da metadata do item, e o
+ * identifier_value de tipo animal de um erro por linha. Só tipo de animal libera número.
+ */
+function ownAnimalIds(obj: Record<string, unknown>): string[] {
+  const found: string[] = [];
+  const add = (v: string | null) => v && found.push(v);
+  const idsOf = (list: unknown) => {
+    if (Array.isArray(list))
+      for (const x of list) if (x && typeof x === "object") {
+        const o = x as Record<string, unknown>;
+        add(animalValue(o.identifier_type ?? o.identifierType, o.value ?? o.identifier_value));
+      }
+  };
+  idsOf(obj.identifiers);
+  const canon = obj.canonical_identifier as Record<string, unknown> | undefined;
+  if (canon && typeof canon === "object") add(animalValue(canon.identifier_type, canon.value));
+  add(animalValue(obj.identifier_type, obj.identifier_value));
+  for (const holder of [obj.metadata, (obj.item as Record<string, unknown> | undefined)?.metadata]) {
+    if (!holder || typeof holder !== "object") continue;
+    for (const [k, v] of Object.entries(holder as Record<string, unknown>)) {
+      const fmt = ANIMAL_VALUE_KEYS[norm(k)];
+      if (fmt && typeof v === "string" && fmt.test(normalizeDigits(v))) found.push(normalizeDigits(v));
+    }
+  }
+  return found;
 }
 
 export function forModel(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(forModel);
-  if (typeof value === "string") return scrubText(value);
+  return walk(value, [], new Set());
+}
+
+function walk(value: unknown, path: string[], inherited: Known): unknown {
+  if (Array.isArray(value)) return value.map((x) => walk(x, path, inherited));
+  if (typeof value === "string") return scrubText(value, { path: path.join("/"), key: path[path.length - 1] ?? "", known: inherited });
   if (!value || typeof value !== "object") return value;
   const obj = value as Record<string, unknown>;
+  const own = ownAnimalIds(obj);
+  const known: Known = own.length ? new Set([...inherited, ...own]) : inherited;
   const typeKey = ID_TYPE_KEYS.find((t) => typeof obj[t] === "string");
   const idTypeIsAnimal = typeKey ? ANIMAL_ID_TYPES.has(norm(String(obj[typeKey]))) : true;
   const out: Record<string, unknown> = {};
@@ -436,9 +513,11 @@ export function forModel(value: unknown): unknown {
       continue;
     }
     const n = norm(k);
+    const childPath = [...path, n];
     if (ID_VALUE_KEYS.has(n) && !idTypeIsAnimal) out[k] = OMIT;
-    else if (typeof v === "string") out[k] = scalarForModel(n, v, typeKey ? norm(String(obj[typeKey])) : undefined);
-    else out[k] = forModel(v);
+    else if (typeof v === "string")
+      out[k] = scalarForModel({ path: childPath.join("/"), key: n, known }, v, typeKey ? norm(String(obj[typeKey])) : undefined);
+    else out[k] = walk(v, childPath, known);
   }
   return out;
 }
@@ -475,13 +554,25 @@ export const REMOTE_TOOLS: RemoteToolDef[] = [
     handler: async (api, a) => {
       const id = a.dfid as string;
       const limit = (a.limit as number) ?? 50;
-      const detail = (await api.get(`/v1/items/${encodeURIComponent(id)}`)) as { item?: { id?: string } };
+      const detail = (await api.get(`/v1/items/${encodeURIComponent(id)}`)) as {
+        item?: { id?: string };
+        identifiers?: unknown;
+        canonical_identifier?: unknown;
+      };
       const itemId = detail?.item?.id;
       const [publicEvents, circuitEvents] = await Promise.all([
         api.get(`/api/items/${encodeURIComponent(id)}/events/public`, { limit }),
         itemId ? api.get("/api/events", { item_id: itemId, limit }) : Promise.resolve(null),
       ]);
-      return { dfid: id, public_events: publicEvents, circuit_events: circuitEvents };
+      // Os identificadores do animal vão junto: são o contexto que deixa o número do PRÓPRIO
+      // animal aparecer no texto dos eventos (forModel), e ajudam o assistente a ler o histórico.
+      return {
+        dfid: id,
+        identifiers: detail?.identifiers ?? [],
+        canonical_identifier: detail?.canonical_identifier ?? null,
+        public_events: publicEvents,
+        circuit_events: circuitEvents,
+      };
     },
     partnerData: true,
   },

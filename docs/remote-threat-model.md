@@ -24,11 +24,23 @@ human formatting. The policy keeps that from reaching the LLM provider by defaul
      year ranges and DFIDs do not count;
    - **a length cap**: 120 characters, or 400 for API messages, with `…[truncado]`.
 
-   API messages (`message`, `error_message` of per-row errors) quote the animal number, and that
-   explanation is what the assistant needs. In those fields only, an animal-number token (14 or
-   15 digits, `BR` + 15 digits, DFID; a 14-digit token that is a valid CNPJ is not kept) is held
-   aside before the scrub and put back after it. The rest of the message is scrubbed as usual.
-   Partner free text (`motivo` and the like) has no such exemption.
+   **Numbers of the animal itself (decision of 2026-10-01).** A run of 8 or more digits in free
+   text is omitted, unless it is an animal identifier already known in the same context of the
+   response, with an animal type:
+   - in a per-row error: the `identifier_value` of that error (for a tag replacement, the
+     replaced number);
+   - in an animal's detail or history: its `identifiers[]` and canonical identifiers (SISBOV,
+     numeroElementoIdentificacao, chip), and only for that item, never its list siblings.
+
+   A number with a non-animal type (CPF, CNPJ, document) never releases text. DFIDs are kept by
+   format. This applies only to API messages, anchored on the response path (`errors[].message`,
+   top-level `error_message`, `result_summary.errors[].message`, `rows[].error_message`), and to
+   public-fact fields (`motivo`, vaccine, medication...). A `message` key anywhere else, such as in
+   a payload or partner metadata, is ordinary free text. A generic 14- or 15-digit pattern is not
+   used: it also matches other national numbers, such as the 15-digit health card (CNS).
+
+   **GTA (decision of 2026-10-01).** The GTA number is not sent to the LLM provider. A movement
+   event keeps its type and date. A GTA number in free text falls under the 8+ digit rule.
 
 A person's name in free text cannot be detected reliably. The untrusted-data notice tells the
 assistant that free text may still contain personal data and must not be repeated verbatim.

@@ -327,7 +327,7 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(out.endsWith("…[truncado]")).toBe(true);
     expect(out.length).toBe(120 + "…[truncado]".length);
     const msg = "the replaced number is not registered, so there is no animal to link the new number to. Send the animal's history under the replaced number first, in an earlier request.";
-    expect((forModel({ message: msg }) as { message: string }).message).toBe(msg);
+    expect(msgOf(forModel(rowError(msg)))).toBe(msg); // mensagem da API no caminho errors[].message: teto 400
   });
 
   it("identificador e data em chave própria passam; o mesmo número em texto livre sai", () => {
@@ -345,39 +345,95 @@ describe("2. uma política de saída para todas as ferramentas", () => {
     expect(partnerText("baixa do animal 105500497219998 por venda")).toBe("[omitido]");
   });
 
-  // Mensagem da API cita o número do animal: ele é guardado, o resto passa pelo scrub.
-  const OLD_NOT_FOUND =
-    "Tag replacement: the replaced number (076957439329511) is not registered, so there is no animal to link the new number to. Send the animal's history under the replaced number first; nothing was ingested for this row.";
+  // 7ª rodada: preservação contextual. Número de animal só é mantido em texto quando já é
+  // identificador de animal conhecido no próprio contexto da resposta.
+  const OLD = "076957439329511";
+  const OLD_NOT_FOUND = `Tag replacement: the replaced number (${OLD}) is not registered, so there is no animal to link the new number to. Send the animal's history under the replaced number first; nothing was ingested for this row.`;
+  const rowError = (message: string, identifier_type = "SISBOV", identifier_value = OLD) => ({
+    errors: [{ row_index: 0, reason_code: "tag_replacement_old_not_found", identifier_type, identifier_value, message }],
+  });
+  const msgOf = (out: unknown) => (out as { errors: { message: string }[] }).errors[0]!.message;
+  const CNS = "898001160651234"; // CNS sintético, 15 dígitos
 
-  it("mensagem real de tag_replacement_old_not_found chega intacta", () => {
-    expect(forModel({ errors: [{ reason_code: "tag_replacement_old_not_found", message: OLD_NOT_FOUND }] })).toEqual({
-      errors: [{ reason_code: "tag_replacement_old_not_found", message: OLD_NOT_FOUND }],
-    });
-    expect(scrub("item DFID-BEEF-BR-2026-001415-2797eb e BR105500497219998")).toBe(
-      "item DFID-BEEF-BR-2026-001415-2797eb e BR105500497219998",
-    );
-    // 14 dígitos sem DV de CNPJ válido é guardado; com DV válido pode ser CNPJ citado e é cortado
-    expect(scrub("the replaced number (07695743932951) is not registered")).toBe("the replaced number (07695743932951) is not registered");
-    expect(scrub("the replaced number (11222333000181) is not registered")).toBe("the replaced number ([omitido]) is not registered");
+  it("erro real: o número substituído da linha é preservado na mensagem", () => {
+    expect(msgOf(forModel(rowError(OLD_NOT_FOUND)))).toBe(OLD_NOT_FOUND);
   });
 
-  it("mesma mensagem com CPF embutido: CPF cortado, número do animal mantido", () => {
+  it("erro com CPF/telefone/e-mail embutidos: cortados, número da linha mantido", () => {
     const msg = OLD_NOT_FOUND.replace("first;", "first (producer CPF 529.982.247-25, tel (67) 99999-0000, joao@ex.com);");
-    const out = (forModel({ error_message: msg }) as { error_message: string }).error_message;
-    expect(out).toContain("076957439329511");
-    for (const leaked of ["529.982.247-25", "99999-0000", "joao@ex.com"]) expect(out).not.toContain(leaked);
+    const out = msgOf(forModel(rowError(msg)));
+    expect(out).toContain(OLD);
     expect(out).toContain("producer CPF [omitido], tel [omitido], [omitido]");
   });
 
-  it("mensagem com código além do número do animal continua omitida, e o teto de 400 vale", () => {
-    expect(scrub("the replaced number (076957439329511) is not registered NTI5Ljk4Mi4yNDctMjU=")).toBe("[omitido]");
-    const long = `number (076957439329511) ${"x ".repeat(300)}`;
-    expect(scrub(long).endsWith("…[truncado]")).toBe(true);
+  it("erro cuja mensagem cita número que NÃO é o da linha sai omitido", () => {
+    expect(msgOf(forModel(rowError(OLD_NOT_FOUND.replace(OLD, CNS))))).toBe("[omitido]");
   });
 
-  it("texto livre do parceiro com o número do animal continua omitido", () => {
-    expect(partnerText(OLD_NOT_FOUND)).toBe("[omitido]");
-    expect(partnerText("baixa do animal 076957439329511")).toBe("[omitido]");
+  it("identifier_value de tipo não-animal não libera o número na mensagem", () => {
+    // CNPJ com DV válido: a camada 1 corta o número; sem DV válido, a regra de 8+ dígitos omite tudo
+    expect(msgOf(forModel(rowError("routing value 11222333000181 has no rule", "cnpj", "11222333000181")))).toBe(
+      "routing value [omitido] has no rule",
+    );
+    expect(msgOf(forModel(rowError("routing value 12345678000100 has no rule", "cnpj", "12345678000100")))).toBe("[omitido]");
+  });
+
+  it("mensagem da API: código além do número continua omitida; teto de 400", () => {
+    expect(msgOf(forModel(rowError(`number (${OLD}) NTI5Ljk4Mi4yNDctMjU=`)))).toBe("[omitido]");
+    const long = msgOf(forModel(rowError(`number (${OLD}) ${"x ".repeat(300)}`)));
+    expect(long.endsWith("…[truncado]")).toBe(true);
+    expect(long.length).toBe(400 + "…[truncado]".length);
+  });
+
+  it("CNS em payload.message, metadata.message e motivo sai omitido (message fora do caminho da API)", () => {
+    const text = `paciente cartão SUS ${CNS}`;
+    const out = forModel({ payload: { message: text }, metadata: { message: text }, motivo: text }) as Record<string, unknown>;
+    expect(out).toEqual({ payload: { message: "[omitido]" }, metadata: { message: "[omitido]" }, motivo: "[omitido]" });
+    // e message fora do caminho tem o teto de texto livre (120), não o de 400
+    const long = (forModel({ payload: { message: "y ".repeat(150) } }) as { payload: { message: string } }).payload.message;
+    expect(long.length).toBe(120 + "…[truncado]".length);
+  });
+
+  const animal = (motivo: string, extra: Record<string, unknown> = {}) => ({
+    item: { dfid: "DFID-BEEF-BR-2026-001415-2797eb", metadata: { numeroelementoidentificacao: "105500497219998" } },
+    identifiers: [{ identifier_type: "SISBOV", value: "105500497219998" }, ...((extra.ids as unknown[]) ?? [])],
+    events: [{ event_type: "item_terminated", payload: { motivo } }],
+  });
+  const motivoOf = (out: unknown) => (out as { events: { payload: { motivo: string } }[] }).events[0]!.payload.motivo;
+
+  it("motivo com o brinco do PRÓPRIO animal chega inteiro", () => {
+    expect(motivoOf(forModel(animal("morte natural, brinco 105500497219998")))).toBe("morte natural, brinco 105500497219998");
+  });
+
+  it("motivo com o número de OUTRO animal sai omitido", () => {
+    expect(motivoOf(forModel(animal("morte natural, brinco 105500497210001")))).toBe("[omitido]");
+  });
+
+  it("identifier de tipo não-animal no item não libera o mesmo número no motivo", () => {
+    const out = forModel(animal("devolvido ao 52998224725", { ids: [{ identifier_type: "CPF", value: "52998224725" }] }));
+    expect(motivoOf(out)).toBe("devolvido ao [omitido]"); // CPF com DV válido: camada 1
+    const out2 = forModel(animal("devolvido ao 12345678900", { ids: [{ identifier_type: "documento", value: "12345678900" }] }));
+    expect(motivoOf(out2)).toBe("[omitido]"); // sem DV válido: não liberado, regra de 8+ dígitos
+  });
+
+  it("número de um item não vale para outro item da lista", () => {
+    const out = forModel({
+      items: [
+        { dfid: "DFID-BEEF-BR-2026-000001-aaaaaa", metadata: { sisbov: "105500497219998", motivo: "brinco 105500497219998" } },
+        { dfid: "DFID-BEEF-BR-2026-000002-bbbbbb", metadata: { sisbov: "105500497210001", motivo: "brinco 105500497219998" } },
+      ],
+    }) as { items: { metadata: { motivo: string } }[] };
+    expect(out.items.map((i) => i.metadata.motivo)).toEqual(["brinco 105500497219998", "[omitido]"]);
+  });
+
+  it("GTA 123456789 sai omitido, inclusive no motivo do próprio animal", () => {
+    expect(partnerText("GTA 123456789")).toBe("[omitido]");
+    expect(motivoOf(forModel(animal("transferência GTA 123456789")))).toBe("[omitido]");
+  });
+
+  it("DFID em mensagem da API é preservado pelo formato", () => {
+    const m = "item DFID-BEEF-BR-2026-001415-2797eb has no routing rule";
+    expect(msgOf(forModel(rowError(m)))).toBe(m);
   });
 
   const LEGIT: Record<string, string> = {
