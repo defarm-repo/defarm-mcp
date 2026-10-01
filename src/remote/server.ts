@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { RemoteApi } from "./api.js";
 import { REMOTE_TOOLS } from "./tools.js";
-import { DOC_RESOURCES, fetchDoc, searchSections } from "./docs.js";
+import { DOC_RESOURCES, fetchDoc, guidePageUrl, searchSections } from "./docs.js";
 
 export interface RemoteServerOptions {
   docsBase: string;
@@ -35,13 +35,15 @@ export function createRemoteMcpServer(api: RemoteApi, opts: RemoteServerOptions)
 
   server.tool(
     "defarm_search_docs",
-    "Busca na documentação da DeFarm (guias, perfil PNIB, identificadores, eventos, erros, SDKs). Devolve as seções mais relevantes.",
+    "Busca na documentação da DeFarm (guias, perfil PNIB, identificadores, eventos, erros, SDKs). Devolve as seções mais relevantes, cada uma com o link da página do guia.",
     { query: z.string().min(2).describe("Termos, ex.: 'troca de brinco', 'reason_code ambiguous_identifier'") },
     async (args: Record<string, unknown>) => {
       const full = await fetchDoc(opts.docsBase, "/llms-full.txt", opts.fetchImpl);
       const hits = searchSections(full, String(args.query ?? ""));
       const text = hits.length
-        ? hits.map((h) => `## ${h.title}\n${h.text}`).join("\n\n")
+        ? hits
+            .map((h) => `## ${h.title}\n${h.page ? `Página: ${guidePageUrl(opts.docsBase, h.page)}\n` : ""}${h.text}`)
+            .join("\n\n")
         : "Nada encontrado. Veja o recurso defarm://docs/llms.txt (índice) ou a spec OpenAPI.";
       return { content: [{ type: "text" as const, text }] };
     },

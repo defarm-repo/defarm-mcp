@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createRemoteHttpHandler } from "../src/remote/http.js";
 import { REMOTE_TOOLS } from "../src/remote/tools.js";
-import { searchSections } from "../src/remote/docs.js";
+import { guidePageUrl, searchSections } from "../src/remote/docs.js";
 import { RateLimiter } from "../src/remote/http.js";
 
 const KEY = "chave-secreta-do-parceiro-123";
@@ -182,5 +182,18 @@ describe("searchSections", () => {
   it("ignora acento e ordena por relevância", () => {
     const md = "## Vacinação\nvacina vacina\n## Baixa\nvacina";
     expect(searchSections(md, "vacinacao")[0]!.title).toBe("Vacinação");
+  });
+  it("marca cada seção com o guia de origem, sem vazar o marcador", () => {
+    const md = "# Doc\n\n<!-- overview.md -->\n# Visão\n## Auth\nchave x-api-key\n\n<!-- errors.md -->\n# Erros\n## Códigos\nreason_code chave";
+    const hits = searchSections(md, "chave");
+    expect(hits.map((h) => [h.title, h.page])).toEqual([
+      ["Auth", "overview"],
+      ["Códigos", "errors"],
+    ]);
+    expect(hits.every((h) => !h.text.includes("<!--"))).toBe(true);
+  });
+
+  it("monta o link da página do guia", () => {
+    expect(guidePageUrl("https://docs.defarm.net/", "errors")).toBe("https://docs.defarm.net/docs/guia/errors");
   });
 });
