@@ -139,7 +139,9 @@ describe("MCP remoto: governança", () => {
 
   it("histórico omite dado pessoal e coordenada, mantém o resto", async () => {
     const r = await rpc("tools/call", { name: "defarm_animal_history", arguments: { dfid: DFID } });
-    expect(r.text).toContain("GTA-9");
+    // Movimentação: só tipo e data chegam ao modelo; o número da GTA fica fora (review do #9).
+    expect(r.text).toContain("item_movement");
+    expect(r.text).not.toContain("GTA-9");
     expect(r.text).toContain("item_born");
     for (const leaked of ["12345678900", "-20.47", "-54.6", "Fulano"]) expect(r.text).not.toContain(leaked);
     expect(r.text).toContain("[omitido]");

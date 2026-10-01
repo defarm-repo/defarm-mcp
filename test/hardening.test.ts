@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { clientIp, createRemoteHttpHandler } from "../src/remote/http.js";
-import { ALLOWED_KEYS, DENY_SUBSTRINGS, REMOTE_TOOLS, UNTRUSTED_NOTICE, forModel } from "../src/remote/tools.js";
+import { ALLOWED_KEYS, DENY_SUBSTRINGS, PUBLIC_FACT_KEYS, REMOTE_TOOLS, UNTRUSTED_NOTICE, forModel } from "../src/remote/tools.js";
 
 const KEY = "chave-de-teste-hardening";
 const DFID = "DFID-BEEF-BR-2026-001416-7566ee";
@@ -67,6 +67,8 @@ describe("1. texto de parceiro vai num envelope de dado não confiável", () => 
       const out = JSON.parse(toolText(r));
       expect(Object.keys(out)).toEqual(["notice", "data"]);
       expect(out.notice).toBe(UNTRUSTED_NOTICE);
+      expect(out.notice).toMatch(/may still contain personal data/);
+      expect(out.notice).toMatch(/do not repeat free text/);
       // O canário continua lá (dado não é apagado), mas só dentro de `data`.
       expect(JSON.stringify(out.data)).toContain(CANARY);
       expect(toolText(r).indexOf(CANARY)).toBeGreaterThan(toolText(r).indexOf(UNTRUSTED_NOTICE));
@@ -153,6 +155,55 @@ describe("2. uma política de saída para todas as ferramentas", () => {
   it("texto livre perde CPF, CNPJ e e-mail; SISBOV de 15 dígitos fica", () => {
     const out = forModel({ message: "linha do produtor 123.456.789-00 (12.345.678/0001-99, a@b.com), animal 105500497219998" });
     expect(out).toEqual({ message: "linha do produtor [omitido] ([omitido], [omitido]), animal 105500497219998" });
+  });
+
+  const scrub = (v: string) => (forModel({ message: v }) as { message: string }).message;
+
+  it("telefone BR em texto livre, com e sem DDD/+55, com e sem pontuação", () => {
+    for (const phone of [
+      "+55 67 99999-0000",
+      "+55 (67) 99999-0000",
+      "(67) 99999-0000",
+      "(67)3333.4444",
+      "67 99999 0000",
+      "99999-0000",
+      "3333-4444",
+      "67999990000",
+      "+5567999990000",
+      "5567999990000",
+      "6733334444",
+    ])
+      expect(scrub(`ligar ${phone} amanhã`)).toBe("ligar [omitido] amanhã");
+  });
+
+  it("CPF/CNPJ: formatado ou com DV válido sai; dígitos sem DV válido ficam (SISBOV de 14/15)", () => {
+    expect(scrub("cpf 529.982.247-25")).toBe("cpf [omitido]");
+    expect(scrub("cpf 52998224725")).toBe("cpf [omitido]"); // DV válido
+    expect(scrub("cnpj 11.222.333/0001-81")).toBe("cnpj [omitido]");
+    expect(scrub("cnpj 11222333000181")).toBe("cnpj [omitido]"); // DV válido
+    expect(scrub("animal 07695743932951")).toBe("animal 07695743932951"); // 14 dígitos, DV de CNPJ inválido
+    expect(scrub("animal 105500497219998")).toBe("animal 105500497219998");
+    expect(scrub("numero 12345678900")).toBe("numero 12345678900"); // 11 dígitos, DV de CPF inválido
+  });
+
+  it("não corta hash, DFID, datas nem número de ledger", () => {
+    const keep =
+      "tx 070bc20f74dfee409b57a7ba995c6755252793fb88201c19cf8fc56123e73b76 DFID-BEEF-BR-2026-001415-2797eb 2025-06-15 20250615 64706496";
+    expect(scrub(keep)).toBe(keep);
+  });
+
+  it("fato público com 'nome' na chave passa (allowlist antes da negação); o resto continua negado", () => {
+    expect(
+      forModel({ nomeVacina: "BRUCELOSE B19", nome_medicamento: "IVERMECTINA", principioAtivo: "ivermectina", nomeProdutor: "Fulano" }),
+    ).toEqual({ nomeVacina: "BRUCELOSE B19", nome_medicamento: "IVERMECTINA", principioAtivo: "ivermectina", nomeProdutor: "[omitido]" });
+    expect([...PUBLIC_FACT_KEYS].every((k) => !k.includes("produtor") && !k.includes("proprietario"))).toBe(true);
+  });
+
+  it("número da GTA não vai ao modelo; tipo e data do evento de movimentação vão", () => {
+    expect(forModel({ event_type: "item_movement", payload: { gta_number: "GTA-9", numeroGta: "123", dataMovimentacao: "2025-07-01" } })).toEqual({
+      event_type: "item_movement",
+      payload: { gta_number: "[omitido]", numeroGta: "[omitido]", dataMovimentacao: "2025-07-01" },
+    });
   });
 
   it("nenhuma chave permitida colide com a lista de negação", () => {
